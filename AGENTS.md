@@ -81,3 +81,41 @@ log to the dashboard; that log is the authority. The harness exists so local gam
 
 Python 3.12, type-annotated, ruff and mypy strict clean. Keep `agent.py` readable: it is the
 thing a judge reads if your games get flagged, and the thing you have to explain at the final.
+
+## Project status (updated 2026-08-31)
+
+Current agent: NNUE-style learned eval (768->256->32->1 MLP via onnxruntime) inside
+iterative-deepening alpha-beta. Ships as `agent.py` + `features.py` + `weights/model.onnx`
+(~0.8 MB zip; build with `uv run python -m harness.package`).
+
+Done this session:
+- Trained the eval net on 2M Lichess+Stockfish positions: val MAE ~237cp, corr 0.82. Pipeline
+  in `training/`: download.py -> data.npz, train.py -> model.pt, export.py -> weights/model.onnx,
+  evaluate_model.py (sanity + color-symmetry invariant). Encoding is side-to-move-relative, so
+  the net output feeds negamax directly.
+- Beats every baseline. Relative Elo (anchor random=0, 3000ms+100ms): candidate 785, numba 663,
+  minimax 656, greedy 283, random 0.
+- Windows-safe testing (the harness can't run here): `training/quickplay.py` (one game),
+  `training/test.py` (smoke + node-rate bench), `training/elo.py` (round-robin Elo with bootstrap
+  CIs; auto-calibrates to an ABSOLUTE scale when Stockfish dials are in the pool).
+- Local Stockfish calibration opponents in `opponents/` (NEVER ship): `fetch_stockfish.py`
+  (SF18 in opponents/engines/), `sf_engine.py`, `make_dials.py`, and sf1400..sf2200 wrappers.
+  Verified SF plays (opens ~0.3s, moves in ~0.1s once Defender has scanned the exe).
+
+Absolute Elo (done 2026-09-01): the SF gauntlet (180 games, 3000ms+100ms, sf1400..sf2200) puts
+the candidate at ~1373 absolute Elo (95% CI [1214, 1477]), just below sf1400 (score 12.5%,
+2-11-47); dials self-consistent to ~91 Elo RMS. Confirmed the packager bundles only root `*.py` +
+`weights/` (submission = agent.py + features.py + weights/model.onnx, 768 KB); `opponents/` and
+`training/` stay out. Note: SF gauntlet runs HANG ON EXIT on Windows (SimpleEngine.quit via
+atexit) after printing the table -- kill leftover python/stockfish once you have the results.
+
+Next step: work the backlog to push past 1400.
+
+Backlog (highest value first): eval magnitudes are compressed -> retrain on a win-probability
+target; add quiescence search; replace the ~39us/call ONNX eval with a numba forward pass for
+more search depth.
+
+Gotchas: the harness fails on Windows (`selectors` on pipes, WinError 10038) -- use the
+`training/` drivers. Training-only deps `zstandard` + `onnx` were `uv pip install`ed and are NOT
+in pyproject (which mirrors the platform), so `uv sync` removes them -- reinstall to retrain.
+More detail in `memory/`.
