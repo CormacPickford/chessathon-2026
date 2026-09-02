@@ -1,0 +1,3 @@
+- [Windows testing](windows-testing.md) — harness can't run on Windows; use training/quickplay.py
+- [Eval-net pipeline](eval-net-pipeline.md) — how the learned eval is trained, exported, and wired into agent.py
+- [SF Elo calibration](sf-elo-calibration.md) — candidate is ~1373 absolute Elo; SF runs hang on exit
