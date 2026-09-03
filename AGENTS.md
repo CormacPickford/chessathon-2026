@@ -84,15 +84,23 @@ thing a judge reads if your games get flagged, and the thing you have to explain
 
 ## Project status (updated 2026-09-03)
 
-**~1661 absolute Elo** (336-game SF gauntlet), up from 1508 for the pre-eval-backlog agent.
-Measured within-pool gains: eval backlog +105, pruning batch +15 (nothing), and the final
-seven-change batch is +60 self-play but not yet gauntlet-measured.
+**~1773 absolute Elo** (336-game SF gauntlet, CI [1717, 1841], 49.0% against the pool,
+37-20-39) -- above sf1600, just under sf1800, up from 1508 at the start of the session.
+Within-pool measured gains: eval backlog **+105**, pruning batch **+15**, seven-change batch
+**+84**. That last gauntlet is the most trustworthy of the three: dials came out MONOTONIC for
+the first time (1521 < 1737 < 1802 < 1915 < 2025) with residual RMS 119.
 
-**The headline lesson: speed beats accuracy, and self-play lies.** A 2.2x faster eval bought
-+170 self-play; a genuinely better eval bought +24. But summed self-play deltas (+224, +140)
-transferred at ~47% and ~11% respectively -- agents sharing an eval share blind spots, so
-beating your own predecessor overstates real strength. Always seat the previous agent in the
-gauntlet, and halve any self-play number before believing it.
+**The headline lesson: speed beats accuracy.** A 2.2x faster eval bought +170 self-play; a
+genuinely better eval bought +24. Every large gain this session came from making the engine
+search more in the same time, not from making it judge positions better.
+
+**Self-play transfer is unpredictable, so always seat the previous agent in the gauntlet.**
+Measured transfer rates: eval batch +224 -> +105 (47%), pruning batch +140 -> +15 (11%),
+seven-change batch +60 -> +84 (140%). The pruning batch was pure depth, which converts
+directly into wins against an opponent sharing your blind spots and much less against
+Stockfish; the seven-change batch was largely eval speed, which helps against everyone. A
+self-play number on its own predicts almost nothing -- only a gauntlet with the predecessor
+in the pool settles it.
 
 Absolute scale is only +-150: dials are compressed and occasionally inverted (sf1800 fitted
 1916 above sf2000's 1880), and identical code drifts ~30 Elo between runs. Real strength sits

@@ -5,20 +5,29 @@ metadata:
   type: project
 ---
 
-**Current: ~1661 absolute Elo** (2026-09-03, second gauntlet, 336 games, dials sf1400..sf2200
-plus `opponents/prev_tt`). CI [1593, 1714], 36.5%, 24-22-50. `prev_tt` — the agent that read
-1613 in the FIRST gauntlet — read 1646 in this one, i.e. **~30 Elo of drift for identical
-code**, so never compare absolute numbers across runs.
+**Current: ~1773 absolute Elo** (2026-09-03, third gauntlet, 336 games, dials sf1400..sf2200
+plus `opponents/prev_prune`). CI [1717, 1841], 49.0% against the pool, 37-20-39 — above
+sf1600, just under sf1800. **This is the most trustworthy run of the three**: the dials came
+out monotonic for the first time (1521 < 1737 < 1802 < 1915 < 2025), residual RMS 119. Earlier
+runs had inversions (sf1600 above sf1800; sf1800 above sf2000), so treat those as ±150.
 
-**The pruning batch transferred at ~11%.** Capture-gen + null move + LMR/killers summed to
-+140 in self-play and measured **+15** in the gauntlet (1661 vs 1646, CIs overlapping) — i.e.
-nothing. Compare the eval batch at ~47% (+224 → +105). Best explanation: pure-depth changes
-convert directly into wins against an opponent that shares your eval and blind spots, and buy
-much less against Stockfish, which fails differently. **Halve any self-play delta before
-believing it; halve it again for changes that only buy depth.**
+Session progression, each measured with the predecessor in the same pool:
 
-Earlier: **~1613 absolute Elo** (first gauntlet, with `opponents/prev_mvv` at 1508).
-CI [1543, 1687], score 21.5%, W-D-L 6-19-47.
+| gauntlet | baseline | candidate | within-pool gain |
+|---|---|---|---|
+| after quiescence/MVV-LVA | prev 1321 | 1407 | +86 |
+| after eval backlog | prev_mvv 1508 | 1613 | **+105** |
+| after pruning | prev_tt 1646 | 1661 | **+15** |
+| after 7-change batch | prev_prune 1689 | **1773** | **+84** |
+
+**Self-play transfer is unpredictable — measured 47%, 11%, and 140%.** The pruning batch
+(+140 self-play → +15) was pure depth, which converts into wins against an opponent sharing
+your blind spots but not against Stockfish. The seven-change batch (+60 → +84) was mostly eval
+speed, which helps against everyone. A self-play number alone predicts almost nothing; only a
+gauntlet with the predecessor seated settles it.
+
+Note the absolute scale still drifts between runs for identical code: `prev_tt` read 1613 then
+1646, `prev_prune` read 1661 then 1689. Never compare absolute numbers across gauntlets.
 The pre-eval-backlog agent re-measured at **1508** in the SAME pool, so the three steps
 (win-prob eval, numba forward pass, transposition table) are worth **+105 Elo measured**, not
 the +224 the self-play deltas summed to. The candidate now wins 25 games off the dial pool
