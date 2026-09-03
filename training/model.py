@@ -1,4 +1,4 @@
-2"""The evaluation network, shared by training and ONNX export.
+"""The evaluation network, shared by training and ONNX export.
 
 A small NNUE-style MLP: 768 binary features -> 256 -> 32 -> 1. The single output is the
 position value in *pawns* from the side-to-move's point of view (the training targets are

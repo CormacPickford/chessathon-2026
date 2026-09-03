@@ -17,12 +17,32 @@ for a piece with code c on square sq is (c - 1) * 64 + sq.
 
 Scores are likewise stored from the mover's point of view, which is exactly what a negamax
 search wants back from evaluate().
+
+The network's single output is a LOGIT: `win_probability = sigmoid(output)`. Training fits
+`sigmoid(cp / EVAL_SCALE)`, so at the optimum the raw output is `cp / EVAL_SCALE` and
+inference recovers centipawns by multiplying by EVAL_SCALE. Fitting probabilities rather than
+raw centipawns is what stops the magnitudes compressing: the loss stops caring whether a won
+position is +800 or +1500 (both are ~certainly winning) and spends the model's capacity near
+equality, where the choice of move actually turns.
 """
 
 import chess
 import numpy as np
 
 NUM_FEATURES = 768
+
+# Centipawns per unit of network output, used ONLY at inference to read the logit back as a
+# centipawn-like score. Training squashes with TRAIN_SCALE below.
+#
+# These differ on purpose. Fitting sigmoid(cp / 200) makes the model's logit a *shrunken*
+# estimate of cp -- measured slope 0.335 against truth -- because probability space barely
+# distinguishes +800 from +2000. Move choice does not care: minimax is invariant to any
+# monotone rescaling. Delta pruning does care, because its margin is additive and written in
+# absolute centipawns, so against a 3x-shrunken eval the fixed margin stops pruning and the
+# tree grows ~43%. Dividing by the measured slope puts the output back on a true centipawn
+# footing and hands delta pruning the scale it was tuned for.
+TRAIN_SCALE = 200.0  # cp per logit in the training target: sigmoid(cp / TRAIN_SCALE)
+EVAL_SCALE = 600.0  # TRAIN_SCALE / 0.335, the fitted compression slope
 
 _OUR_BASE = 0
 _THEIR_BASE = 6
