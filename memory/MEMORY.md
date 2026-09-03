@@ -1,3 +1,5 @@
-- [Windows testing](windows-testing.md) — harness can't run on Windows; use training/quickplay.py
-- [Eval-net pipeline](eval-net-pipeline.md) — how the learned eval is trained, exported, and wired into agent.py
-- [SF Elo calibration](sf-elo-calibration.md) — candidate is ~1373 absolute Elo; SF runs hang on exit
+- [Windows testing](windows-testing.md) — harness can't run on Windows; use training/quickplay.py, plus uv/Stockfish bootstrap and the perf_counter timing trap
+- [Eval-net pipeline](eval-net-pipeline.md) — how the learned eval is trained and exported, and the TRAIN_SCALE/EVAL_SCALE split that breaks delta pruning if got wrong
+- [Agent architecture](agent-architecture.md) — what is in the shipped files and the traps behind each piece
+- [SF Elo calibration](sf-elo-calibration.md) — ~1661 absolute Elo; self-play deltas transfer at ~11-47%, so halve them before believing
+- [Agent test drivers](agent-test-drivers.md) — the training/ scripts that verify the agent on Windows, and what each is for

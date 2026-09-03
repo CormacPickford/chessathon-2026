@@ -1,10 +1,18 @@
-"""Train the evaluation MLP on the sampled Lichess positions.
+﻿"""Train the evaluation MLP on the sampled Lichess positions.
 
     uv run python training/train.py --data training/data.npz --epochs 20
 
-Targets are centipawns from the mover's point of view, scaled to pawns (/100) and fit with
-a Huber loss so the decisive tails do not dominate. Reports validation MAE in centipawns and
-saves the best model to training/model.pt.
+Targets are centipawns from the mover's point of view, squashed to a WIN PROBABILITY with
+`sigmoid(cp / TRAIN_SCALE)` and fit with MSE on probabilities. The network output is the
+matching logit; inference multiplies it by features.EVAL_SCALE, which is deliberately larger
+than TRAIN_SCALE to undo the shrinkage this target induces (see features.py).
+
+Fitting raw centipawns under Huber (the previous scheme) spent most of the model's capacity
+learning the difference between winning and very winning, which no search decision depends on,
+and left the near-equal region -- where every real move choice is made -- underfit. That is
+what "compressed magnitudes" was a symptom of. Reports validation MAE in both probability and
+centipawns, the latter for comparison against the old runs, and saves the best model to
+training/model.pt.
 """
 
 import argparse
@@ -17,10 +25,8 @@ import torch
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from features import codes_to_features
+from features import TRAIN_SCALE, codes_to_features
 from training.model import EvalNet
-
-SCALE = 100.0  # centipawns per pawn
 
 
 def batches(n: int, batch_size: int, shuffle: bool) -> list[np.ndarray]:
@@ -50,14 +56,19 @@ def main() -> None:
 
     blob = np.load(args.data)
     codes = blob["codes"]
-    scores = blob["scores"].astype(np.float32) / SCALE  # pawns, mover POV
+    cp = blob["scores"].astype(np.float32)  # centipawns, mover POV
+    # The target the model actually fits: probability of the mover winning.
+    scores = 1.0 / (1.0 + np.exp(-cp / TRAIN_SCALE))
     n = len(scores)
     print(f"loaded {n:,} positions from {args.data}")
+    print(f"target: win probability = sigmoid(cp / {TRAIN_SCALE:.0f})  "
+          f"mean {scores.mean():.3f}  std {scores.std():.3f}")
 
     perm = np.random.permutation(n)
-    codes, scores = codes[perm], scores[perm]
+    codes, scores, cp = codes[perm], scores[perm], cp[perm]
     n_val = int(n * args.val_frac)
     val_codes, val_scores = codes[:n_val], scores[:n_val]
+    val_cp = torch.from_numpy(cp[:n_val])
     tr_codes, tr_scores = codes[n_val:], scores[n_val:]
     val_x = to_features(val_codes)
     val_y = torch.from_numpy(val_scores)
@@ -66,9 +77,10 @@ def main() -> None:
     model = EvalNet()
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
-    loss_fn = nn.SmoothL1Loss()  # Huber, delta = 1 pawn
+    # MSE on probabilities. The model emits the logit, so the sigmoid lives in the loss.
+    loss_fn = nn.MSELoss()
 
-    best_mae = float("inf")
+    best_wp_mae = float("inf")
     for epoch in range(1, args.epochs + 1):
         model.train()
         t0 = time.monotonic()
@@ -78,7 +90,7 @@ def main() -> None:
             x = to_features(tr_codes[idx])
             y = torch.from_numpy(tr_scores[idx])
             opt.zero_grad()
-            loss = loss_fn(model(x), y)
+            loss = loss_fn(torch.sigmoid(model(x)), y)
             loss.backward()
             opt.step()
             running += loss.item() * len(idx)
@@ -87,25 +99,30 @@ def main() -> None:
 
         model.eval()
         with torch.no_grad():
-            pred = torch.empty_like(val_y)
+            logits = torch.empty_like(val_y)
             for i in range(0, len(val_y), args.batch_size):
-                pred[i : i + args.batch_size] = model(val_x[i : i + args.batch_size])
-            val_mae_cp = (pred - val_y).abs().mean().item() * SCALE
-            corr = np.corrcoef(pred.numpy(), val_y.numpy())[0, 1]
+                logits[i : i + args.batch_size] = model(val_x[i : i + args.batch_size])
+            pred_wp = torch.sigmoid(logits)
+            val_wp_mae = (pred_wp - val_y).abs().mean().item()
+            # Same predictions read back on the old centipawn scale, so the number stays
+            # comparable with the pre-win-probability runs.
+            val_mae_cp = (logits * TRAIN_SCALE - val_cp).abs().mean().item()
+            corr = np.corrcoef(pred_wp.numpy(), val_y.numpy())[0, 1]
 
         dt = time.monotonic() - t0
         flag = ""
-        if val_mae_cp < best_mae:
-            best_mae = val_mae_cp
+        if val_wp_mae < best_wp_mae:
+            best_wp_mae = val_wp_mae
             torch.save(model.state_dict(), args.out)
             flag = "  <- saved"
         print(
-            f"epoch {epoch:2d}  train_huber {running / seen:.4f}  "
-            f"val_MAE {val_mae_cp:6.1f}cp  corr {corr:.3f}  {dt:4.0f}s{flag}",
+            f"epoch {epoch:2d}  train_mse {running / seen:.5f}  "
+            f"val_MAE {val_wp_mae:.4f}wp / {val_mae_cp:6.1f}cp  corr {corr:.3f}  "
+            f"{dt:4.0f}s{flag}",
             flush=True,
         )
 
-    print(f"\nbest val MAE {best_mae:.1f}cp  saved to {args.out}")
+    print(f"\nbest val MAE {best_wp_mae:.4f} win-prob  saved to {args.out}")
 
 
 if __name__ == "__main__":

@@ -7,3 +7,16 @@ submission.zip
 
 # Local Stockfish calibration binary (fetched via opponents/fetch_stockfish.py; never ship, too big for GitHub)
 opponents/engines/
+
+# Sampled training data. Regenerate with training/download.py --mode scatter (~14 min).
+# data.npz reached 54.6 MB, past GitHub's 50 MB warning and heading for its 100 MB hard limit.
+training/*.npz
+
+# Tooling artefact, regenerate with training/export.py. The SHIPPED weights are
+# weights/net.pt, which stays tracked.
+training/model.onnx
+
+# A/B snapshots of previous agent versions (see memory/agent-test-drivers.md). Machine-local
+# measurement scaffolding: ~0.8 MB of duplicated weights each, and absolute Elo is not
+# comparable across machines anyway, so a fresh clone should re-snapshot rather than inherit.
+opponents/prev*/

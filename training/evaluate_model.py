@@ -7,6 +7,7 @@ rough magnitude we know, and checks that a position and its mirror encode identi
 invariant the side-to-move-relative encoding must satisfy.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -15,10 +16,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from features import board_to_codes, codes_to_features
+from features import EVAL_SCALE, board_to_codes, codes_to_features
 from training.model import EvalNet
-
-SCALE = 100.0
 
 # (description, fen, expected sign from mover POV)
 CASES = [
@@ -44,17 +43,29 @@ def load_model(path: Path) -> EvalNet:
 def score_cp(model: EvalNet, board: chess.Board) -> float:
     feats = codes_to_features(board_to_codes(board))
     with torch.no_grad():
-        pawns = model(torch.from_numpy(feats).unsqueeze(0)).item()
-    return pawns * SCALE
+        logit = model(torch.from_numpy(feats).unsqueeze(0)).item()
+    return logit * EVAL_SCALE
+
+
+def score_wp(model: EvalNet, board: chess.Board) -> float:
+    """The quantity the model actually fits: the mover's win probability."""
+    feats = codes_to_features(board_to_codes(board))
+    with torch.no_grad():
+        logit = model(torch.from_numpy(feats).unsqueeze(0)).item()
+    return 1.0 / (1.0 + np.exp(-logit))
 
 
 def main() -> None:
-    model = load_model(Path("training/model.pt"))
+    parser = argparse.ArgumentParser(description="Sanity-check a trained eval model.")
+    parser.add_argument("--model", type=Path, default=Path("training/model.pt"))
+    args = parser.parse_args()
+    model = load_model(args.model)
 
-    print("=== known positions (score is mover POV, centipawns) ===")
+    print("=== known positions (mover POV) ===")
     for desc, fen, expect in CASES:
         board = chess.Board(fen)
-        print(f"{score_cp(model, board):+8.0f}cp   expect {expect:24s}  {desc}")
+        print(f"{score_cp(model, board):+8.0f}cp  wp {score_wp(model, board):.3f}   "
+              f"expect {expect:24s}  {desc}")
 
     print("\n=== color-symmetry invariant ===")
     rng = np.random.default_rng(1)
