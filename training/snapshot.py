@@ -10,9 +10,9 @@ snapshot and the live candidate would silently evaluate with the SAME net. As a 
 snapshot's imports resolve to opponents/<name>/evalnet.py and its own weights, so a frozen net
 really is frozen -- which is the whole point of a baseline.
 
-Only agent.py needs rewriting: evalnet.py and features.py have no in-repo imports, and
-evalnet loads its weights from `Path(__file__).parent / weights`, which becomes the snapshot's
-own copy automatically.
+agent.py and qsearch.py need rewriting (they import in-repo modules); evalnet.py and
+features.py have no in-repo imports, and evalnet loads its weights from
+`Path(__file__).parent / weights`, which becomes the snapshot's own copy automatically.
 """
 
 import argparse
@@ -25,8 +25,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def rewrite_agent_imports(text: str) -> str:
-    """Make the copied agent import its sibling modules, not the top-level ones."""
+    """Make the copied module import its sibling modules, not the top-level ones."""
     text = re.sub(r"^import evalnet$", "from . import evalnet", text, flags=re.MULTILINE)
+    text = re.sub(r"^import qsearch$", "from . import qsearch", text, flags=re.MULTILINE)
     text = re.sub(r"^from features import", "from .features import", text, flags=re.MULTILINE)
     text = re.sub(r"^from evalnet import", "from .evalnet import", text, flags=re.MULTILINE)
     return text
@@ -47,13 +48,19 @@ def main() -> None:
     (dest / "weights").mkdir(parents=True)
 
     (dest / "__init__.py").write_text("", encoding="utf-8")
+    copied = ["agent.py"]
     agent_src = (ROOT / "agent.py").read_text(encoding="utf-8")
     (dest / "agent.py").write_text(rewrite_agent_imports(agent_src), encoding="utf-8")
+    if (ROOT / "qsearch.py").exists():  # older baselines predate the jitted quiescence
+        qs_src = (ROOT / "qsearch.py").read_text(encoding="utf-8")
+        (dest / "qsearch.py").write_text(rewrite_agent_imports(qs_src), encoding="utf-8")
+        copied.append("qsearch.py")
     shutil.copy(ROOT / "evalnet.py", dest / "evalnet.py")
     shutil.copy(ROOT / "features.py", dest / "features.py")
     shutil.copy(ROOT / "weights" / "net.pt", dest / "weights" / "net.pt")
+    copied += ["evalnet.py", "features.py", "weights"]
 
-    print(f"froze current agent into {dest} (agent.py + evalnet.py + features.py + weights)")
+    print(f"froze current agent into {dest} ({' + '.join(copied)})")
 
 
 if __name__ == "__main__":

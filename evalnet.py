@@ -112,13 +112,23 @@ def _forward(
         if h1[j] < 0.0:
             h1[j] = 0.0
 
+    # Layer 2, restructured for speed at identical output. Two changes over the naive
+    # j-outer/k-inner form: (1) k-outer means the inner loop walks w2[k, :] contiguously
+    # instead of striding by n2 down a column, which is far kinder to the cache; (2) after the
+    # ReLU above, many h1[k] are exactly 0 and contribute nothing, so those rows are skipped --
+    # the standard NNUE sparsity trick. Same arithmetic, fewer cache misses and fewer FLOPs.
     n2 = b2.shape[0]
     h2 = np.empty(n2, dtype=np.float32)
     for j in range(n2):
-        acc = b2[j]
-        for k in range(n1):
-            acc += h1[k] * w2[k, j]
-        h2[j] = acc if acc > 0.0 else 0.0
+        h2[j] = b2[j]
+    for k in range(n1):
+        hk = h1[k]
+        if hk != 0.0:
+            for j in range(n2):
+                h2[j] += hk * w2[k, j]
+    for j in range(n2):
+        if h2[j] < 0.0:
+            h2[j] = 0.0
 
     out = b3[0]
     for k in range(n2):
@@ -173,13 +183,23 @@ def _forward_bb(
         if h1[j] < 0.0:
             h1[j] = 0.0
 
+    # Layer 2, restructured for speed at identical output. Two changes over the naive
+    # j-outer/k-inner form: (1) k-outer means the inner loop walks w2[k, :] contiguously
+    # instead of striding by n2 down a column, which is far kinder to the cache; (2) after the
+    # ReLU above, many h1[k] are exactly 0 and contribute nothing, so those rows are skipped --
+    # the standard NNUE sparsity trick. Same arithmetic, fewer cache misses and fewer FLOPs.
     n2 = b2.shape[0]
     h2 = np.empty(n2, dtype=np.float32)
     for j in range(n2):
-        acc = b2[j]
-        for k in range(n1):
-            acc += h1[k] * w2[k, j]
-        h2[j] = acc if acc > 0.0 else 0.0
+        h2[j] = b2[j]
+    for k in range(n1):
+        hk = h1[k]
+        if hk != 0.0:
+            for j in range(n2):
+                h2[j] += hk * w2[k, j]
+    for j in range(n2):
+        if h2[j] < 0.0:
+            h2[j] = 0.0
 
     out = b3[0]
     for k in range(n2):
@@ -246,16 +266,28 @@ def _forward_dual_bb(
         if accb[j] < 0.0:
             accb[j] = 0.0
 
+    # Layer 2, restructured like _forward_bb's: pick the mover/opponent accumulators once
+    # instead of branching per element, then walk w2's contiguous rows k-outer, skipping the
+    # rows whose post-ReLU activation is exactly 0. Same arithmetic, cache-friendly and sparse.
+    mover = accw if white_to_move else accb
+    opp = accb if white_to_move else accw
     h2n = b2.shape[0]
     hid = np.empty(h2n, dtype=np.float32)
     for j in range(h2n):
-        acc = b2[j]
-        for k in range(h1):
-            if white_to_move:
-                acc += accw[k] * w2[k, j] + accb[k] * w2[h1 + k, j]
-            else:
-                acc += accb[k] * w2[k, j] + accw[k] * w2[h1 + k, j]
-        hid[j] = acc if acc > 0.0 else 0.0
+        hid[j] = b2[j]
+    for k in range(h1):
+        mk = mover[k]
+        if mk != 0.0:
+            for j in range(h2n):
+                hid[j] += mk * w2[k, j]
+    for k in range(h1):
+        ok = opp[k]
+        if ok != 0.0:
+            for j in range(h2n):
+                hid[j] += ok * w2[h1 + k, j]
+    for j in range(h2n):
+        if hid[j] < 0.0:
+            hid[j] = 0.0
 
     out = b3[0]
     for k in range(h2n):
