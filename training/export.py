@@ -59,8 +59,9 @@ def main() -> None:
     parser.add_argument("--numba-out", type=Path, default=Path("weights/net.pt"))
     args = parser.parse_args()
 
-    model = EvalNet()
-    model.load_state_dict(torch.load(args.model, map_location="cpu"))
+    sd = torch.load(args.model, map_location="cpu")
+    model = EvalNet(hidden1=sd["net.0.bias"].shape[0], hidden2=sd["net.2.bias"].shape[0])
+    model.load_state_dict(sd)
     model.eval()
     export_numba(model, args.numba_out)
 

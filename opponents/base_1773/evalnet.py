@@ -30,18 +30,12 @@ torch.set_num_threads(1)
 _WEIGHTS = torch.load(
     Path(__file__).resolve().parent / "weights" / "net.pt", map_location="cpu"
 )
-W1: np.ndarray = _WEIGHTS["w1"].numpy()  # (768, H1), row per input feature
+W1: np.ndarray = _WEIGHTS["w1"].numpy()  # (768, 256), row per input feature
 B1: np.ndarray = _WEIGHTS["b1"].numpy()
-W2: np.ndarray = _WEIGHTS["w2"].numpy()  # (H1, H2) single, or (2*H1, H2) dual-perspective
+W2: np.ndarray = _WEIGHTS["w2"].numpy()  # (256, 32)
 B2: np.ndarray = _WEIGHTS["b2"].numpy()
-W3: np.ndarray = _WEIGHTS["w3"].numpy()  # (H2, 1)
+W3: np.ndarray = _WEIGHTS["w3"].numpy()  # (32, 1)
 B3: np.ndarray = _WEIGHTS["b3"].numpy()
-
-# Two architectures share this file. The single-perspective net feeds one H1-wide accumulator
-# straight into w2 (H1, H2); the dual-perspective net concatenates the mover's and opponent's
-# accumulators, so its w2 has 2*H1 rows. That shape is the unambiguous tell, so nothing else has
-# to be recorded to know which forward pass the shipped weights want.
-MODE_DUAL: bool = W2.shape[0] == 2 * W1.shape[1]
 
 HIDDEN1 = B1.shape[0]
 HIDDEN2 = B2.shape[0]
@@ -187,82 +181,6 @@ def _forward_bb(
     return float(out)
 
 
-@njit(cache=False, fastmath=True, nogil=True)
-def _forward_dual_bb(
-    pawns: int, knights: int, bishops: int, rooks: int, queens: int, kings: int,
-    white: int, black: int, white_to_move: bool,
-    w1: np.ndarray, b1: np.ndarray, w2: np.ndarray, b2: np.ndarray,
-    w3: np.ndarray, b3: np.ndarray,
-) -> float:
-    """Logit for the dual-perspective accumulator net (see training/model2.py).
-
-    Builds two H1-wide accumulators in one pass over the pieces -- white's perspective and
-    black's -- then feeds [side-to-move, opponent] through w2/w3. w1 is (768, H1) shared; w2 is
-    (2*H1, H2) with the first H1 rows applying to the mover's accumulator and the next H1 to the
-    opponent's. This is the from-scratch form; the search can later maintain the two
-    accumulators incrementally across make/unmake, which is the whole point of the split.
-    """
-    h1 = b1.shape[0]
-    accw = np.empty(h1, dtype=np.float32)
-    accb = np.empty(h1, dtype=np.float32)
-    for j in range(h1):
-        accw[j] = b1[j]
-        accb[j] = b1[j]
-
-    for plane in range(6):
-        if plane == 0:
-            bb = pawns
-        elif plane == 1:
-            bb = knights
-        elif plane == 2:
-            bb = bishops
-        elif plane == 3:
-            bb = rooks
-        elif plane == 4:
-            bb = queens
-        else:
-            bb = kings
-        for color in range(2):  # 0 = white pieces, 1 = black pieces
-            work = bb & (white if color == 0 else black)
-            # From white's view a white piece is "ours" (plane), a black piece "theirs"
-            # (plane+6); from black's view it is the mirror, with the square flipped.
-            code_w = plane if color == 0 else plane + 6
-            code_b = plane if color == 1 else plane + 6
-            base_w = code_w * 64
-            base_b = code_b * 64
-            while work:
-                low = work & -work
-                sq = _bit_index(low)
-                work ^= low
-                row_w = base_w + sq
-                row_b = base_b + (sq ^ 56)
-                for j in range(h1):
-                    accw[j] += w1[row_w, j]
-                    accb[j] += w1[row_b, j]
-
-    for j in range(h1):
-        if accw[j] < 0.0:
-            accw[j] = 0.0
-        if accb[j] < 0.0:
-            accb[j] = 0.0
-
-    h2n = b2.shape[0]
-    hid = np.empty(h2n, dtype=np.float32)
-    for j in range(h2n):
-        acc = b2[j]
-        for k in range(h1):
-            if white_to_move:
-                acc += accw[k] * w2[k, j] + accb[k] * w2[h1 + k, j]
-            else:
-                acc += accb[k] * w2[k, j] + accw[k] * w2[h1 + k, j]
-        hid[j] = acc if acc > 0.0 else 0.0
-
-    out = b3[0]
-    for k in range(h2n):
-        out += hid[k] * w3[k, 0]
-    return float(out)
-
-
 def forward(codes: np.ndarray) -> float:
     """Network logit for a position's piece codes. Kept for the training-side tooling."""
     return _forward(codes, W1, B1, W2, B2, W3, B3)
@@ -272,20 +190,7 @@ def forward_board(
     pawns: int, knights: int, bishops: int, rooks: int, queens: int, kings: int,
     us: int, them: int, flip: bool,
 ) -> float:
-    """Network logit from raw bitboards -- the path the search actually uses.
-
-    `us`/`them` are the side-to-move's and opponent's colour masks and `flip` is True when Black
-    is to move, matching the single-perspective encoding. The dual net wants the same facts in
-    white/black terms, so they are recovered from `flip`.
-    """
-    if MODE_DUAL:
-        white = them if flip else us
-        black = us if flip else them
-        return _forward_dual_bb(
-            to_signed(pawns), to_signed(knights), to_signed(bishops), to_signed(rooks),
-            to_signed(queens), to_signed(kings), to_signed(white), to_signed(black), not flip,
-            W1, B1, W2, B2, W3, B3,
-        )
+    """Network logit from raw bitboards -- the path the search actually uses."""
     return _forward_bb(
         to_signed(pawns), to_signed(knights), to_signed(bishops), to_signed(rooks),
         to_signed(queens), to_signed(kings), to_signed(us), to_signed(them), flip,
@@ -293,11 +198,6 @@ def forward_board(
     )
 
 
-# Compile everything now, at import, so no real move ever pays for compilation. Both forward
-# passes are warmed regardless of which weights shipped, so a later weight swap never compiles
-# on the clock.
+# Compile everything now, at import, so no real move ever pays for compilation.
 forward(np.zeros(64, dtype=np.int8))
 forward_board(0, 0, 0, 0, 0, 0, 0, 0, False)
-_forward_dual_bb(0, 0, 0, 0, 0, 0, 0, 0, True,
-                 W1, B1, np.zeros((2 * W1.shape[1], B2.shape[0]), dtype=np.float32), B2,
-                 W3, B3)

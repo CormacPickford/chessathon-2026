@@ -61,6 +61,13 @@ class Player:
 
 
 def load_module(name: str, path: Path) -> ModuleType:
+    # Self-contained snapshots (see training/snapshot.py) ship as packages with their own
+    # evalnet/features/weights and relative imports, so a frozen net stays frozen even when
+    # the live candidate shares this process. Import them by package path so `from . import
+    # evalnet` resolves to the snapshot's copy rather than the top-level module.
+    if (path / "__init__.py").exists():
+        pkg = ".".join(path.resolve().relative_to(Path(__file__).resolve().parent.parent).parts)
+        return importlib.import_module(f"{pkg}.agent")
     spec = importlib.util.spec_from_file_location(name, path / "agent.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -191,11 +198,20 @@ def main() -> None:
     parser.add_argument("--inc-ms", type=int, default=100)
     parser.add_argument("--anchor", default="random")
     parser.add_argument("--bootstrap", type=int, default=300)
+    parser.add_argument("--ponder", action="store_true",
+                        help="leave pondering on (default off: it is unfair in-process)")
     args = parser.parse_args()
 
     specs = [("candidate", args.candidate)] + [(Path(o).name, Path(o)) for o in args.opponents]
     players = [Player(name, path, load_module(f"agent_{k}", path)) for k, (name, path) in
                enumerate(specs)]
+    # Local Elo runs both agents in ONE process, so a background ponder search steals the core
+    # from the opponent's thinking and flatters whoever ponders. Off by default here; the real
+    # platform gives each agent its own container, where pondering is free and stays enabled.
+    if not args.ponder:
+        for p in players:
+            if hasattr(p.module, "PONDER_ENABLED"):
+                p.module.PONDER_ENABLED = False
     names = [p.name for p in players]
     fens = opening_fens(args.openings)
     n = len(players)

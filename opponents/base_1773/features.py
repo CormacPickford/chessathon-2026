@@ -42,7 +42,7 @@ NUM_FEATURES = 768
 # tree grows ~43%. Dividing by the measured slope puts the output back on a true centipawn
 # footing and hands delta pruning the scale it was tuned for.
 TRAIN_SCALE = 200.0  # cp per logit in the training target: sigmoid(cp / TRAIN_SCALE)
-EVAL_SCALE = 530.0  # 1 / fitted logit-per-cp slope (0.00189) for the 10M-data 256 net
+EVAL_SCALE = 600.0  # TRAIN_SCALE / 0.335, the fitted compression slope
 
 _OUR_BASE = 0
 _THEIR_BASE = 6
@@ -85,26 +85,3 @@ def codes_to_features(codes: np.ndarray) -> np.ndarray:
     cols = (vals - 1) * 64 + squares
     feats[rows, cols] = 1.0
     return feats
-
-
-def codes_to_dual_features(codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """From mover-POV codes, return (feats_us, feats_them) for the dual-perspective net.
-
-    feats_us is the ordinary encoding. feats_them is the SAME position seen from the opponent:
-    the stored codes are already mover-relative, so the opponent's view is recovered by flipping
-    every square (sq ^ 56) and swapping the our/their half (code 1..6 <-> 7..12). This lets the
-    two-perspective net train from the existing single-perspective (mover-POV) data.
-    """
-    single = codes.ndim == 1
-    batch = codes[None] if single else codes
-    n = batch.shape[0]
-    feats_us = codes_to_features(batch)
-    feats_them = np.zeros((n, NUM_FEATURES), dtype=np.float32)
-    rows, squares = np.nonzero(batch > 0)
-    vals = batch[rows, squares].astype(np.int64)
-    swapped = np.where(vals <= 6, vals + 6, vals - 6)
-    cols = (swapped - 1) * 64 + (squares ^ 56)
-    feats_them[rows, cols] = 1.0
-    if single:
-        return feats_us[0], feats_them[0]
-    return feats_us, feats_them

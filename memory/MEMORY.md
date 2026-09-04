@@ -3,3 +3,4 @@
 - [Agent architecture](agent-architecture.md) — what is in the shipped files and the traps behind each piece
 - [SF Elo calibration](sf-elo-calibration.md) — ~1661 absolute Elo; self-play deltas transfer at ~11-47%, so halve them before believing
 - [Agent test drivers](agent-test-drivers.md) — the training/ scripts that verify the agent on Windows, and what each is for
+- [A/B measurement (2400 push)](ab-measurement-2400-push.md) — snapshot packages, sf2400+ dials, ponder-off elo, netquality.py; goal 1773→2400

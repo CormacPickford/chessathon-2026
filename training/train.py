@@ -49,8 +49,13 @@ def main() -> None:
     parser.add_argument("--val-frac", type=float, default=0.03)
     parser.add_argument("--out", type=Path, default=Path("training/model.pt"))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--hidden1", type=int, default=256)
+    parser.add_argument("--hidden2", type=int, default=32)
+    parser.add_argument("--threads", type=int, default=0, help="cap torch threads (0 = default)")
     args = parser.parse_args()
 
+    if args.threads > 0:
+        torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -74,7 +79,8 @@ def main() -> None:
     val_y = torch.from_numpy(val_scores)
     print(f"train {len(tr_scores):,}  val {n_val:,}  threads {torch.get_num_threads()}")
 
-    model = EvalNet()
+    model = EvalNet(hidden1=args.hidden1, hidden2=args.hidden2)
+    print(f"arch 768->{args.hidden1}->{args.hidden2}->1")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     # MSE on probabilities. The model emits the logit, so the sigmoid lives in the loss.

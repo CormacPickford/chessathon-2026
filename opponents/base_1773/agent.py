@@ -11,12 +11,11 @@ nothing is hanging.
 import math
 import threading
 import time
-from collections.abc import Iterator
 
 import chess
 
-import evalnet
-from features import EVAL_SCALE
+from . import evalnet
+from .features import EVAL_SCALE
 
 MATE = 1_000_000
 # The net emits a logit (sigmoid of it is the mover's win probability); EVAL_SCALE converts
@@ -102,9 +101,7 @@ _ponder_stop: bool = False
 # gets searched over and over. Caching it buys two things: whole searches skipped, and a
 # known-good move to try first at nodes we cannot skip.
 _TT_EXACT, _TT_LOWER, _TT_UPPER = 0, 1, 2
-TT_MAX = 1_000_000  # entries; ~250 MB of dict overhead, well inside the 2 GB limit. Bigger is
-# better here because the table is wiped WHOLESALE when it fills (see negamax), so a larger cap
-# means far fewer of those wipes over a long game and more surviving cutoffs at platform depth.
+TT_MAX = 400_000  # entries; ~100 MB of dict overhead, well inside the 2 GB limit
 _TT: dict[int, tuple[int, int, float, chess.Move | None]] = {}
 
 # Quiet-move ordering. Captures order themselves by MVV-LVA, but quiet moves had no ordering
@@ -326,54 +323,6 @@ def _has_non_pawn_material(board: chess.Board) -> bool:
     return bool(us & (board.knights | board.bishops | board.rooks | board.queens))
 
 
-def _staged_moves(
-    board: chess.Board, tt_move: chess.Move | None, ply: int
-) -> Iterator[tuple[chess.Move, bool]]:
-    """Yield (move, is_quiet) in cutoff-friendly order, generating quiet moves last and only
-    when reached.
-
-    A full `list(board.legal_moves)` is the single most expensive thing a node does, and the
-    quiet moves -- the bulk of it -- are wasted work at the many nodes that cut off on the TT
-    move or a capture. So the phases here are generated lazily: the transposition-table move
-    first, then captures and queen promotions by MVV-LVA, then the killer moves, and only if
-    none of those has caused a cutoff does the caller pull on the quiet moves, which are the
-    one generation this defers. Captures land on opponent-occupied squares and quiets on empty
-    ones, so the two sets are disjoint and together exactly cover the legal moves; TT and
-    killer moves are de-duplicated so nothing is searched twice. Legality of the TT and killer
-    moves is checked directly, which is far cheaper than generating the whole list to look them
-    up and closes the hash-collision hole that an illegal move would otherwise open.
-    """
-    yielded: set[chess.Move] = set()
-
-    if tt_move is not None and board.is_legal(tt_move):
-        yielded.add(tt_move)
-        yield tt_move, not board.is_capture(tt_move) and tt_move.promotion is None
-
-    for move in _noisy_moves(board):  # captures + queen promotions, MVV-LVA order
-        if move not in yielded:
-            yielded.add(move)
-            yield move, False
-
-    if ply <= MAX_PLY:
-        for killer in _KILLERS[ply]:
-            if killer is not None and killer not in yielded and board.is_legal(killer):
-                yielded.add(killer)
-                yield killer, not board.is_capture(killer) and killer.promotion is None
-
-    # Quiet moves land on empty squares, so `to_mask=~occupied` selects them. Castling is the
-    # exception: python-chess filters it by the ROOK's square, which is occupied, so it never
-    # appears under that mask and has to be added from generate_castling_moves explicitly.
-    quiets = [m for m in board.generate_legal_moves(to_mask=~board.occupied)
-              if m not in yielded]
-    if board.castling_rights:  # skip the castling generator's work in the vast majority of nodes
-        quiets.extend(m for m in board.generate_castling_moves() if m not in yielded)
-    quiets.sort(key=lambda m: _HISTORY[m.from_square * 64 + m.to_square], reverse=True)
-    for move in quiets:
-        # These land on empty squares, so none is a capture; only a pawn under-promotion is
-        # noisy, and it is the one quiet-phase move that should not be reduced or pruned.
-        yield move, move.promotion is None
-
-
 def negamax(
     board: chess.Board, depth: int, alpha: float, beta: float, ply: int = 0,
     can_null: bool = True,
@@ -438,6 +387,19 @@ def negamax(
         if score >= beta:
             return beta
 
+    moves = list(board.legal_moves)
+    if not moves:
+        # Mate scores shrink with distance from the root, so a mate in one outranks a mate in
+        # six and the engine actually finishes won games instead of shuffling.
+        return float(-MATE + ply) if in_check else 0.0
+
+    ordered = _order(board, moves, ply)
+    # The stored move was best here last time, so it is the likeliest cutoff. Membership is
+    # checked rather than assumed: keys are 64-bit hashes and a collision would otherwise let
+    # an illegal move through, which loses the game outright.
+    if tt_move is not None and tt_move in moves:
+        ordered = [tt_move, *(m for m in ordered if m != tt_move)]
+
     # Futility: at shallow depth, a quiet move from a position already far below alpha is very
     # unlikely to rescue it. Computed once per node, not once per move.
     futile = (
@@ -448,9 +410,8 @@ def negamax(
     )
 
     best_move: chess.Move | None = None
-    any_move = False
-    for i, (move, is_quiet) in enumerate(_staged_moves(board, tt_move, ply)):
-        any_move = True
+    for i, move in enumerate(ordered):
+        is_quiet = not board.is_capture(move) and move.promotion is None
         if futile and is_quiet and i > 0 and not board.gives_check(move):
             continue  # keep at least one move so the node still returns something real
 
@@ -500,12 +461,6 @@ def negamax(
                     killers[0] = move
                 _HISTORY[move.from_square * 64 + move.to_square] += depth * depth
             break
-
-    if not any_move:
-        # No legal move was generated: checkmate if the king is attacked, else stalemate. The
-        # ply-adjusted mate score makes a nearer mate outrank a farther one. Detected after the
-        # fact rather than up front, so a full move generation is never paid just to notice.
-        return float(-MATE + ply) if in_check else 0.0
 
     # Mate scores are relative to this node's ply, so they would be wrong if the same position
     # were reached at a different distance from the root. Keep them out of the table.
