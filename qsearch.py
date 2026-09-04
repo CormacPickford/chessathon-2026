@@ -541,6 +541,215 @@ def legal_quiets(out: np.ndarray, board: chess.Board) -> int:
     ))
 
 
+# ---------------------------------------------------------------------------
+# Interior-search primitives: a castling-aware make and full move generator.
+#
+# Quiescence never castles (below the horizon), so its _make and generators omit castling
+# entirely and are left untouched -- they are shipped and verified. The interior search does
+# need castling and castling-rights tracking, so it gets its OWN make (_make_full, which
+# carries and updates the rights bitboard) and its own full generator (_gen_all). Correctness
+# is verified by perft against python-chess (training/test_qsearch.py), the gold standard.
+#
+# The rights bitboard mirrors python-chess `board.castling_rights`: a mask with a bit set on
+# each ROOK home square that still has the right -- a1(0)/h1(7) for White, a8(56)/h8(63) for
+# Black. Standard chess only; no Chess960 (the platform uses standard positions).
+# ---------------------------------------------------------------------------
+
+_WHITE_CORNERS = _signed_bb((1 << 0) | (1 << 7))
+_BLACK_CORNERS = _signed_bb((1 << 56) | (1 << 63))
+
+
+@njit(cache=False, nogil=True)
+def _make_full(
+    move: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+) -> tuple[int, int, int, int, int, int, int, int, int, int]:
+    """_make plus castling execution and castling-rights maintenance.
+
+    Returns (p, n, b, r, q, k, occw, occb, new_ep, new_castling). A king move of two files is
+    a castle: the king moves by the normal path below and the rook is relocated here too.
+    """
+    frm = move & 63
+    to = (move >> 6) & 63
+    promo = (move >> 12) & 7
+    frm_bb = BB_SQ[frm]
+    to_bb = BB_SQ[to]
+    us = occw if wtm else occb
+    them = occb if wtm else occw
+    new_ep = -1
+    mover_king = (k & frm_bb) != 0
+    is_castle = mover_king and (to - frm == 2 or frm - to == 2)
+
+    if them & to_bb:
+        if p & to_bb:
+            p ^= to_bb
+        elif n & to_bb:
+            n ^= to_bb
+        elif b & to_bb:
+            b ^= to_bb
+        elif r & to_bb:
+            r ^= to_bb
+        elif q & to_bb:
+            q ^= to_bb
+        else:
+            k ^= to_bb
+        them ^= to_bb
+    elif (p & frm_bb) and to == ep:
+        cap_bb = BB_SQ[to - 8] if wtm else BB_SQ[to + 8]
+        p ^= cap_bb
+        them ^= cap_bb
+
+    if p & frm_bb:
+        p ^= frm_bb
+        if promo == 0:
+            p |= to_bb
+            if to - frm == 16 or frm - to == 16:
+                new_ep = (frm + to) >> 1
+        elif promo == 2:
+            n |= to_bb
+        elif promo == 3:
+            b |= to_bb
+        elif promo == 4:
+            r |= to_bb
+        else:
+            q |= to_bb
+    elif n & frm_bb:
+        n ^= frm_bb
+        n |= to_bb
+    elif b & frm_bb:
+        b ^= frm_bb
+        b |= to_bb
+    elif r & frm_bb:
+        r ^= frm_bb
+        r |= to_bb
+    elif q & frm_bb:
+        q ^= frm_bb
+        q |= to_bb
+    else:
+        k ^= frm_bb
+        k |= to_bb
+
+    us ^= frm_bb
+    us |= to_bb
+
+    if is_castle:
+        # Relocate the rook: kingside h-rook to f, queenside a-rook to d.
+        if to > frm:
+            r_frm = frm + 3
+            r_to = frm + 1
+        else:
+            r_frm = frm - 4
+            r_to = frm - 1
+        r_frm_bb = BB_SQ[r_frm]
+        r_to_bb = BB_SQ[r_to]
+        r ^= r_frm_bb
+        r |= r_to_bb
+        us ^= r_frm_bb
+        us |= r_to_bb
+
+    # Rights: a rook leaving a corner (frm) or being captured on a corner (to) clears that
+    # corner's bit; the king moving clears both of its colour's corners.
+    new_castling = castling & ~frm_bb & ~to_bb
+    if mover_king:
+        new_castling &= ~(_WHITE_CORNERS if wtm else _BLACK_CORNERS)
+
+    if wtm:
+        return p, n, b, r, q, k, us, them, new_ep, new_castling
+    return p, n, b, r, q, k, them, us, new_ep, new_castling
+
+
+@njit(cache=False, nogil=True)
+def _gen_castling(
+    out: np.ndarray, cnt: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, castling: int,
+) -> int:
+    """Append legal castling moves. Legality (king not in, through, or into check; squares
+    between empty; the right still held) is fully checked here, so the post-make king-safety
+    filter never rejects a castle it produced."""
+    occ = occw | occb
+    if wtm:
+        if (k & BB_SQ[4]) == 0:  # king not on e1
+            return cnt
+        if ((castling & BB_SQ[7]) and (occ & (BB_SQ[5] | BB_SQ[6])) == 0
+                and _attackers(4, occ, False, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(5, occ, False, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(6, occ, False, p, n, b, r, q, k, occw, occb) == 0):
+            out[cnt] = _pack(4, 6, 0, 0, 6, 0)
+            cnt += 1
+        if ((castling & BB_SQ[0]) and (occ & (BB_SQ[1] | BB_SQ[2] | BB_SQ[3])) == 0
+                and _attackers(4, occ, False, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(3, occ, False, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(2, occ, False, p, n, b, r, q, k, occw, occb) == 0):
+            out[cnt] = _pack(4, 2, 0, 0, 6, 0)
+            cnt += 1
+    else:
+        if (k & BB_SQ[60]) == 0:  # king not on e8
+            return cnt
+        if ((castling & BB_SQ[63]) and (occ & (BB_SQ[61] | BB_SQ[62])) == 0
+                and _attackers(60, occ, True, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(61, occ, True, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(62, occ, True, p, n, b, r, q, k, occw, occb) == 0):
+            out[cnt] = _pack(60, 62, 0, 0, 6, 0)
+            cnt += 1
+        if ((castling & BB_SQ[56]) and (occ & (BB_SQ[57] | BB_SQ[58] | BB_SQ[59])) == 0
+                and _attackers(60, occ, True, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(59, occ, True, p, n, b, r, q, k, occw, occb) == 0
+                and _attackers(58, occ, True, p, n, b, r, q, k, occw, occb) == 0):
+            out[cnt] = _pack(60, 58, 0, 0, 6, 0)
+            cnt += 1
+    return cnt
+
+
+@njit(cache=False, nogil=True)
+def _gen_all(
+    out: np.ndarray,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+) -> int:
+    """Every pseudo-legal move (captures + quiets + castling). Castling is already legal;
+    the rest still needs the make + king-safety filter."""
+    cnt = _gen_noisy(out, p, n, b, r, q, k, occw, occb, wtm, ep)
+    cnt = _gen_quiets(out, cnt, p, n, b, r, q, k, occw, occb, wtm)
+    cnt = _gen_castling(out, cnt, p, n, b, r, q, k, occw, occb, wtm, castling)
+    return cnt
+
+
+@njit(cache=False, nogil=True)
+def _perft(
+    depth: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+) -> int:
+    """Count legal leaf nodes at `depth`. Exercises _gen_all + _make_full + legality exactly as
+    the interior search will, so a perft match with python-chess certifies all three."""
+    if depth == 0:
+        return 1
+    out = np.empty(256, dtype=np.int64)
+    cnt = _gen_all(out, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+    total = 0
+    for i in range(cnt):
+        mv = out[i] & _KEY_MOVE_MASK
+        np_, nn, nb, nr, nq, nk, nw, nbl, nep, nc = _make_full(
+            mv, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+        if _own_king_safe(np_, nn, nb, nr, nq, nk, nw, nbl, wtm):
+            total += _perft(depth - 1, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm, nep, nc)
+    return total
+
+
+def perft(board: chess.Board, depth: int) -> int:
+    """Entry point: jitted perft from a python-chess board."""
+    return int(_perft(
+        depth,
+        to_signed(board.pawns), to_signed(board.knights), to_signed(board.bishops),
+        to_signed(board.rooks), to_signed(board.queens), to_signed(board.kings),
+        to_signed(board.occupied_co[True]), to_signed(board.occupied_co[False]),
+        board.turn, -1 if board.ep_square is None else board.ep_square,
+        to_signed(board.castling_rights),
+    ))
+
+
 @njit(cache=False, nogil=True)
 def _see(
     move: int,
@@ -736,8 +945,72 @@ def quiesce_board(
     ))
 
 
+@njit(cache=False, nogil=True)
+def _negamax_plain(
+    depth: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+    alpha: float, beta: float, ply: int,
+    qs_max_depth: int, delta_margin: int, dual: bool,
+    w1: np.ndarray, b1: np.ndarray, w2: np.ndarray, b2: np.ndarray,
+    w3: np.ndarray, b3: np.ndarray,
+) -> float:
+    """Plain alpha-beta (no TT, no null/LMR/futility), quiescence at the leaves, moves in the
+    packed-key order. This is the reference core: it exists to be proven score-identical to a
+    python-chess negamax with the same ordering and the same jitted leaf eval, before the
+    speed-oriented pruning that will diverge from it is layered on. Fail-hard, mate scores
+    relative to `ply` -- mirroring agent.negamax's contract."""
+    if depth == 0:
+        return _quiesce_bb(p, n, b, r, q, k, occw, occb, wtm, ep,
+                           alpha, beta, 0, ply, qs_max_depth, delta_margin, dual,
+                           w1, b1, w2, b2, w3, b3)
+    out = np.empty(256, dtype=np.int64)
+    cnt = _gen_all(out, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+    _sort_desc(out, cnt)
+    any_legal = False
+    for i in range(cnt):
+        mv = out[i] & _KEY_MOVE_MASK
+        np_, nn, nb, nr, nq, nk, nw, nbl, nep, nc = _make_full(
+            mv, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+        if not _own_king_safe(np_, nn, nb, nr, nq, nk, nw, nbl, wtm):
+            continue
+        any_legal = True
+        score = -_negamax_plain(depth - 1, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm, nep, nc,
+                                -beta, -alpha, ply + 1, qs_max_depth, delta_margin, dual,
+                                w1, b1, w2, b2, w3, b3)
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break
+    if not any_legal:
+        us = occw if wtm else occb
+        kbb = k & us
+        ksq = _bit_index(kbb & -kbb)
+        occ = occw | occb
+        in_check = _attackers(ksq, occ, not wtm, p, n, b, r, q, k, occw, occb) != 0
+        return float(-MATE + ply) if in_check else 0.0
+    return alpha
+
+
+def negamax_plain_board(board: chess.Board, depth: int, alpha: float, beta: float,
+                        ply: int, qs_max_depth: int, delta_margin: int) -> float:
+    """Entry point for the plain jitted negamax -- used by the parity test, not the agent."""
+    return float(_negamax_plain(
+        depth,
+        to_signed(board.pawns), to_signed(board.knights), to_signed(board.bishops),
+        to_signed(board.rooks), to_signed(board.queens), to_signed(board.kings),
+        to_signed(board.occupied_co[True]), to_signed(board.occupied_co[False]),
+        board.turn, -1 if board.ep_square is None else board.ep_square,
+        to_signed(board.castling_rights),
+        alpha, beta, ply, qs_max_depth, delta_margin, evalnet.MODE_DUAL,
+        evalnet.W1, evalnet.B1, evalnet.W2, evalnet.B2, evalnet.W3, evalnet.B3,
+    ))
+
+
 # Warm the whole tree at import so compilation lands in the init budget, never on the clock.
 _b = chess.Board()
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)
+perft(_b, 1)
+negamax_plain_board(_b, 1, -1e9, 1e9, 0, 8, 200)
 _b.push_uci("e2e4")
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)
