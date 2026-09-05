@@ -1,0 +1,13 @@
+﻿2 players, 16 openings, 3 round(s) -> 96 games @ 6000ms+100ms
+
+  20/96 games (0.1/s)
+  40/96 games (0.1/s)
+  60/96 games (0.1/s)
+  80/96 games (0.1/s)
+  96/96 games (0.1/s)
+
+agent           elo          95% ci  games   score   W-D-L
+candidate        64  [   41,   90]     96   67.7%   41-48-7  *
+base_v2net      -64  [  -90,  -41]     96   32.3%   7-48-41
+
+Scale: relative, mean=0, at 6000ms+100ms. * = your agent.
