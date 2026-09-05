@@ -82,22 +82,25 @@ log to the dashboard; that log is the authority. The harness exists so local gam
 Python 3.12, type-annotated, ruff and mypy strict clean. Keep `agent.py` readable: it is the
 thing a judge reads if your games get flagged, and the thing you have to explain at the final.
 
-## Project status (updated 2026-09-03)
+## Project status (updated 2026-09-04)
 
-**~1773 absolute Elo** — 336-game Stockfish gauntlet, CI [1717, 1841], 49.0% against the pool,
-W-D-L 37-20-39. Above sf1600, just under sf1800. Started the session at 1508.
+**~1773 absolute Elo** was the last gauntlet-measured number (2026-09-03, 336 games, CI
+[1717, 1841]). Since then a relative self-play A/B has added strength not yet re-seated in an
+absolute gauntlet (impractical on Windows — see `memory/`). The 2026-09-04 search rewrite alone
+won **+64 self-play Elo, CI [41, 90]** vs the previous shipped agent at a depth-revealing 6000ms.
 
 The agent is a learned NNUE-style eval inside iterative-deepening alpha-beta. It ships as
-`agent.py` + `evalnet.py` + `features.py` + `weights/net.pt` (0.82 MB zip; build with
-`uv run python -m harness.package`).
+`agent.py` + `evalnet.py` + `features.py` + `qsearch.py` + `weights/net.pt` (~0.79 MB zip;
+build with `uv run python -m harness.package`).
 
 - **Eval**: 768->256->32->1 MLP emitting a logit, run by a numba forward pass straight from
   python-chess bitboards. Layer 1 is a sparse row gather, not a matmul: at most 32 of the 768
-  inputs are ever set. 14.0 us/call.
-- **Search**: quiescence (SEE + delta pruning), transposition table, MVV-LVA + killers +
-  history ordering, null move, LMR, PVS, aspiration windows, check extensions, futility and
-  reverse futility, ply-adjusted mate scores, position-aware time budgeting, and pondering on
-  the opponent's clock.
+  inputs are ever set. ~2.3 us/call (layer-2 rewritten k-outer + NNUE-sparse, 2026-09-04).
+- **Search**: iterative-deepening alpha-beta with TT, MVV-LVA + killers + history ordering,
+  null move, LMR, PVS, aspiration windows, check extensions, futility and reverse futility,
+  ply-adjusted mate scores, instability-aware time budgeting, and pondering on the opponent's
+  clock. The whole quiescence subtree AND the interior legal move generators run jitted in
+  numba (`qsearch.py`, output-identical to the Python search), which is the bulk of the tree.
 
 ### What changed on 2026-09-03
 
@@ -171,23 +174,30 @@ then the gauntlet's within-pool number where one exists.
 
 ### Next steps, highest value first
 
-Everything here buys depth. That is deliberate: every large gain this session came from
-searching more in the same time, not from judging positions better.
+Everything here buys depth. That is deliberate: every large gain has come from searching more
+in the same time, not from judging positions better.
 
-1. **Incremental accumulator updates.** push/pop changes at most a couple of pieces, so the
-   first-layer accumulator can be updated rather than rebuilt. The standard NNUE trick and the
-   natural follow-on now that encoding is jitted.
-2. **Numba bitboard move generator.** `list(board.legal_moves)` costs **109.5us**, more than a
-   whole evaluation, and is the single biggest remaining cost — the wall that caps everything
-   else. Potentially worth more than all other items combined. Also the most dangerous: this
-   is where illegal-move bugs come from, and an illegal move loses the game outright. Days of
-   work; verify relentlessly with `training/test_stress.py` and perft.
-3. **Time management refinement.** The current heuristic scales by legal-move count and check
-   status. Real engines also spend more when the best move is unstable between iterations.
-4. **Eval quality, LAST.** Pairwise ordering is 80.6% and that is the ceiling on accuracy, but
-   accuracy has repeatedly been worth less than speed here. If pursued: fit K to the data
-   rather than assuming it (the Texel first step), and blend game outcomes into the target
-   alongside engine evals, which needs a different dataset.
+1. **Jitted interior negamax.** The 2026-09-04 rewrite jitted quiescence and the interior
+   *movegen* (see `qsearch.py`, `memory/jitted-qsearch.md`), so the remaining interior cost is
+   python-chess `board.push`/`pop` (~0.65s of a 1.75s depth-7 tree) plus the boundary
+   conversions in `quiesce_board`. Porting the whole interior negamax onto the jitted bitboard
+   representation (functional make, a jitted TT, killers/history, null-move/LMR/futility,
+   ply-relative mate scores) removes that and is the biggest remaining lever, plausibly another
+   1.5–2x. **Key safety insight:** the *root* move is still chosen in Python over python-chess's
+   verified legal list, so a jitted interior search — exactly like jitted quiescence — can only
+   affect SCORES, never emit an illegal move. That makes this far less dangerous than the old
+   "movegen is where illegal-move bugs come from" note assumed. Verify with score/node-count
+   parity vs the Python negamax (the `training/test_qsearch.py` pattern) plus `test_stress.py`.
+2. **Time management is now instability-aware** (`memory/time-management-overrun.md`): the
+   search extends toward a hard budget only while the best move keeps changing. Further tuning
+   (OVERRUN_FACTOR, min depth) needs a real-clock game A/B — cploss cannot see it.
+3. **Incremental accumulator updates** stay de-prioritised — decided not worth it for a
+   256-wide net, and the dual-perspective net that would enable them was tested and reverted
+   (dead-even A/B, slower eval; see `memory/eval-is-bottleneck.md`).
+4. **Eval quality, LAST.** Pairwise ordering ~83.8% and accuracy has repeatedly been worth less
+   than speed here. If pursued: fit K to the data (the Texel first step) and blend game outcomes
+   into the target. A same-arch retrain is a free-quality win in principle (`data.npz` is
+   present) but the last one barely moved pairwise.
 
 ### Measurement discipline — earned the hard way
 

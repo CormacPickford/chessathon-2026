@@ -266,28 +266,16 @@ def _forward_dual_bb(
         if accb[j] < 0.0:
             accb[j] = 0.0
 
-    # Layer 2, restructured like _forward_bb's: pick the mover/opponent accumulators once
-    # instead of branching per element, then walk w2's contiguous rows k-outer, skipping the
-    # rows whose post-ReLU activation is exactly 0. Same arithmetic, cache-friendly and sparse.
-    mover = accw if white_to_move else accb
-    opp = accb if white_to_move else accw
     h2n = b2.shape[0]
     hid = np.empty(h2n, dtype=np.float32)
     for j in range(h2n):
-        hid[j] = b2[j]
-    for k in range(h1):
-        mk = mover[k]
-        if mk != 0.0:
-            for j in range(h2n):
-                hid[j] += mk * w2[k, j]
-    for k in range(h1):
-        ok = opp[k]
-        if ok != 0.0:
-            for j in range(h2n):
-                hid[j] += ok * w2[h1 + k, j]
-    for j in range(h2n):
-        if hid[j] < 0.0:
-            hid[j] = 0.0
+        acc = b2[j]
+        for k in range(h1):
+            if white_to_move:
+                acc += accw[k] * w2[k, j] + accb[k] * w2[h1 + k, j]
+            else:
+                acc += accb[k] * w2[k, j] + accw[k] * w2[h1 + k, j]
+        hid[j] = acc if acc > 0.0 else 0.0
 
     out = b3[0]
     for k in range(h2n):

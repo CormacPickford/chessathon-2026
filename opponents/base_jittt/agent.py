@@ -16,9 +16,9 @@ from collections.abc import Iterator
 import chess
 import numpy as np
 
-import evalnet
-import qsearch
-from features import EVAL_SCALE
+from . import evalnet
+from . import qsearch
+from .features import EVAL_SCALE
 
 MATE = 1_000_000
 # The net emits a logit (sigmoid of it is the mover's win probability); EVAL_SCALE converts

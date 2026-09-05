@@ -14,11 +14,9 @@ import time
 from collections.abc import Iterator
 
 import chess
-import numpy as np
 
-import evalnet
-import qsearch
-from features import EVAL_SCALE
+from . import evalnet
+from .features import EVAL_SCALE
 
 MATE = 1_000_000
 # The net emits a logit (sigmoid of it is the mover's win probability); EVAL_SCALE converts
@@ -49,25 +47,6 @@ CHECK_EXT_MAX_DEPTH = 6  # extend checks only near the leaves, or the tree explo
 # last one and widen only on a miss.
 ASPIRATION_WINDOW = 50.0
 
-# Instability-aware overrun. The search normally stops at the soft budget from `_budget`. But
-# when the best move keeps CHANGING between iterations, that is exactly the position where one
-# more ply is most likely to change the choice again -- so the deadline is extended toward a
-# hard multiple of the soft budget, and only then. A settled position (best move unchanged) is
-# never granted the extension, so easy moves stay cheap. This only ever ADDS search on unstable
-# moments and never removes any, so it cannot make a move worse; the cost is some extra clock,
-# which the hard clamp in get_move keeps clear of a flag fall. OVERRUN applies from depth 5 up,
-# below which iterations are nearly free and the best move is not yet meaningful.
-OVERRUN_FACTOR = 1.6  # an unstable search may run to this multiple of the soft budget
-OVERRUN_MIN_DEPTH = 5
-
-# Subtrees at this depth or below run entirely in the jitted negamax (qsearch.py) instead of
-# the Python search, trading the Python search machinery at those nodes for compiled-code speed
-# with no python-chess board. The jitted core carries its own null move, LMR, futility, RFP,
-# PVS, check extensions and a transposition table, so the tree stays pruned and transpositions
-# cut. With the jitted TT, 4 is the sweet spot (fastest to depth 9, plateaus above). 0 =
-# disabled (old behaviour). Tuned by A/B.
-JIT_LEAF_DEPTH = 4
-
 # Pondering, on the opponent's clock. Bounded so a background search cannot outlive the
 # opponent's turn by much, and skipped in time trouble where the join would itself cost too
 # much. PONDER_JOIN_S is generous: the thread checks the deadline at every node, so it should
@@ -80,6 +59,10 @@ PONDER_JOIN_S = 0.5
 # flatter us. On the platform each agent has its own container, so pondering costs the
 # opponent nothing and its real value cannot be measured locally either way.
 PONDER_ENABLED = True
+
+# Where a pawn must stand to promote next move; used to skip the promotion scan entirely in
+# the vast majority of positions.
+_PROMO_RANK = {chess.WHITE: chess.BB_RANK_7, chess.BLACK: chess.BB_RANK_2}
 
 PIECE_VALUE = {
     chess.PAWN: 100,
@@ -192,40 +175,77 @@ def _mvv_lva(board: chess.Board, move: chess.Move) -> int:
     return _victim_value(board, move) * 16 - attacker_value
 
 
-def _cached_move(packed: int) -> chess.Move:
-    """chess.Move for a packed (from | to<<6 | promo<<12) int, memoised.
+def _see(board: chess.Board, move: chess.Move) -> int:
+    """Net material won by `move` after both sides trade optimally on that square.
 
-    The jitted generators hand back packed ints; the search still wants Move objects for
-    push/pop and the TT. Constructing one costs more than the generation did, so each distinct
-    move is built once per session. Bounded: there are only ~4k from-to pairs times a few
-    promotion types, and equality/hashing of a cached Move matches a fresh one exactly.
+    Quiescence currently searches every capture, including queen-takes-defended-pawn, which
+    cannot possibly be good. Playing the exchange out with the cheapest available attacker
+    each time tells us that for the cost of a few attack lookups instead of a whole subtree.
+
+    Returns centipawns from the mover's point of view; negative means the exchange loses
+    material. Approximate by design: it ignores pins and does not notice that a capture might
+    expose a bigger threat, which is exactly why it only ever prunes CLEARLY losing captures.
     """
-    move = _MOVE_CACHE.get(packed)
-    if move is None:
-        promo = (packed >> 12) & 7
-        move = chess.Move(packed & 63, (packed >> 6) & 63, promo or None)
-        _MOVE_CACHE[packed] = move
-    return move
+    target = move.to_square
+    gain = [_victim_value(board, move)]
+    attacker_sq = move.from_square
+    attacker_piece = board.piece_type_at(attacker_sq)
+    if attacker_piece is None:
+        return 0
 
+    occupied = board.occupied & ~chess.BB_SQUARES[attacker_sq]
+    if board.is_en_passant(move):
+        occupied &= ~chess.BB_SQUARES[board.ep_square or 0]
+    side = not board.turn
+    on_square = PIECE_VALUE[attacker_piece]
 
-_MOVE_CACHE: dict[int, chess.Move] = {}
+    while True:
+        attackers = board.attackers_mask(side, target) & occupied
+        if not attackers:
+            break
+        # Recapture with the least valuable attacker: it risks the least on the square.
+        best_sq, best_val = -1, 1 << 30
+        remaining = attackers
+        while remaining:
+            low = remaining & -remaining
+            remaining ^= low
+            sq = low.bit_length() - 1
+            piece = board.piece_type_at(sq)
+            if piece is not None and PIECE_VALUE[piece] < best_val:
+                best_sq, best_val = sq, PIECE_VALUE[piece]
+        if best_sq < 0:
+            break
+        gain.append(on_square - gain[-1])
+        on_square = best_val
+        occupied &= ~chess.BB_SQUARES[best_sq]
+        side = not side
+
+    # Walk back up: at each point the side to move could simply decline to recapture.
+    for i in range(len(gain) - 2, -1, -1):
+        gain[i] = -max(-gain[i], gain[i + 1])
+    return gain[0]
 
 
 def _noisy_moves(board: chess.Board) -> list[chess.Move]:
-    """Legal captures and queen promotions -- the moves that can swing material -- best first.
+    """Captures and queen promotions -- the moves that can swing material -- best first.
 
-    Generated by the jitted bitboard generator in qsearch.py (pseudo-legal + king-safety
-    filter), which is what quiescence runs below the horizon; these are the same packed moves
-    converted to chess.Move for the interior search. Set-verified move-for-move against
-    python-chess by training/test_qsearch.py, because the search pushes what this returns and
-    an illegal move loses the game outright.
+    Generating captures directly rather than filtering every legal move matters here because
+    quiescence is most of the tree: full generation costs 100us in a tactical position against
+    23us for captures alone. `generate_legal_captures` omits QUIET promotions, so those are
+    added back, guarded by a bitboard test that is false in almost every position.
     """
-    buf = np.empty(256, dtype=np.int64)
-    cnt = qsearch.legal_noisy(buf, board)
-    return [_cached_move(int(buf[i]) & 0xFFFF) for i in range(cnt)]
+    moves = list(board.generate_legal_captures())
+    promo_pawns = board.pawns & board.occupied_co[board.turn] & _PROMO_RANK[board.turn]
+    if promo_pawns:
+        moves.extend(
+            m for m in board.generate_legal_moves(from_mask=promo_pawns)
+            if m.promotion == chess.QUEEN and not board.is_capture(m)
+        )
+    moves.sort(key=lambda m: _mvv_lva(board, m), reverse=True)
+    return moves
 
 
-def quiesce(board: chess.Board, alpha: float, beta: float, ply: int) -> float:
+def quiesce(board: chess.Board, alpha: float, beta: float, qdepth: int, ply: int = 0) -> float:
     """Search on past the horizon until the position is quiet, then evaluate.
 
     Calling the net in the middle of an exchange is what makes an engine hang pieces: the leaf
@@ -233,14 +253,66 @@ def quiesce(board: chess.Board, alpha: float, beta: float, ply: int) -> float:
     the moment depth runs out, keep playing captures (and, when in check, every evasion) until
     nothing is hanging, and ask the net only there.
 
-    The whole subtree runs jitted in qsearch.py -- generation, make, SEE, delta pruning and
-    the eval never touch a Python object, which is worth ~8x on the bulk of the search tree.
-    Verified move-for-move and score-for-score against the Python original by
-    training/test_qsearch.py. The clock is checked at every negamax entry rather than inside
-    the jitted tree; a single quiescence subtree is bounded by QS_MAX_DEPTH and capture
-    exhaustion, far inside the OVERHEAD_MS headroom.
+    Stalemate is not detected here -- when not in check we only generate captures, so we cannot
+    tell "no captures" from "no moves at all". The main search catches it at every deeper node,
+    and paying for a full legal-move generation at every quiet leaf would cost more than the
+    rare misjudged leaf does.
     """
-    return qsearch.quiesce_board(board, alpha, beta, ply, QS_MAX_DEPTH, DELTA_MARGIN)
+    global _timed_out
+    if time.perf_counter() > _deadline:
+        _timed_out = True
+        return 0.0
+
+    if board.is_check():
+        # Standing pat is not on offer while in check: every evasion has to be tried, quiet
+        # ones included, or the search would call a forced position quiet and misjudge it.
+        moves = list(board.legal_moves)
+        if not moves:
+            return float(-MATE + ply)
+        if qdepth >= QS_MAX_DEPTH:
+            return float(evaluate(board))
+        for move in _order(board, moves, ply):
+            board.push(move)
+            score = -quiesce(board, -beta, -alpha, qdepth + 1, ply + 1)
+            board.pop()
+            if _timed_out:
+                return alpha
+            if score >= beta:
+                return beta
+            if score > alpha:
+                alpha = score
+        return alpha
+
+    # Not in check the side to move can always decline to capture, so the static score is a
+    # lower bound on what the position is worth -- the "stand pat" score.
+    stand_pat = float(evaluate(board))
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
+    if qdepth >= QS_MAX_DEPTH:
+        return alpha
+
+    for move in _noisy_moves(board):
+        # Delta pruning: if winning the victim outright still falls short of alpha, the line is
+        # hopeless and not worth a network call.
+        if stand_pat + _victim_value(board, move) + DELTA_MARGIN < alpha:
+            continue
+        # SEE pruning: a capture that loses material once the square is fought over is not
+        # worth a subtree. Promotions are exempt -- the promoted piece is the point, and SEE
+        # only counts the piece that moved.
+        if move.promotion is None and _see(board, move) < 0:
+            continue
+        board.push(move)
+        score = -quiesce(board, -beta, -alpha, qdepth + 1, ply + 1)
+        board.pop()
+        if _timed_out:
+            return alpha
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+    return alpha
 
 
 def _has_non_pawn_material(board: chess.Board) -> bool:
@@ -288,15 +360,11 @@ def _staged_moves(
                 yielded.add(killer)
                 yield killer, not board.is_capture(killer) and killer.promotion is None
 
-    # Quiet moves from the jitted generator, which knows nothing of castling -- python-chess
-    # supplies that separately, and only when someone still has the right, which is rare.
-    buf = np.empty(256, dtype=np.int64)
-    qcnt = qsearch.legal_quiets(buf, board)
-    quiets = []
-    for i in range(qcnt):
-        move = _cached_move(int(buf[i]) & 0xFFFF)
-        if move not in yielded:
-            quiets.append(move)
+    # Quiet moves land on empty squares, so `to_mask=~occupied` selects them. Castling is the
+    # exception: python-chess filters it by the ROOK's square, which is occupied, so it never
+    # appears under that mask and has to be added from generate_castling_moves explicitly.
+    quiets = [m for m in board.generate_legal_moves(to_mask=~board.occupied)
+              if m not in yielded]
     if board.castling_rights:  # skip the castling generator's work in the vast majority of nodes
         quiets.extend(m for m in board.generate_castling_moves() if m not in yielded)
     quiets.sort(key=lambda m: _HISTORY[m.from_square * 64 + m.to_square], reverse=True)
@@ -316,18 +384,7 @@ def negamax(
         return 0.0
 
     if depth == 0:
-        return quiesce(board, alpha, beta, ply)
-
-    # Hand the shallowest subtrees -- the vast majority of interior nodes -- to the fully
-    # jitted plain negamax, which runs the whole subtree (make, generation, legality,
-    # quiescence) without a python-chess object. It carries no TT/pruning, so it is only worth
-    # it where the subtree is small; above JIT_LEAF_DEPTH the Python search keeps its TT, null
-    # move, LMR and futility. JIT_LEAF_DEPTH=0 reproduces the old behaviour exactly. The jitted
-    # core is proven score-identical to a plain Python search by training/test_negamax.py, and
-    # its move generation perft-matches python-chess.
-    if depth <= JIT_LEAF_DEPTH:
-        return qsearch.negamax_tt_board(
-            board, depth, alpha, beta, ply, can_null, QS_MAX_DEPTH, DELTA_MARGIN)
+        return quiesce(board, alpha, beta, 0, ply)
 
     alpha_orig = alpha
     key = _tt_key(board)
@@ -489,15 +546,10 @@ def get_move(fen: str, time_left_ms: int) -> str:
     if time_left_ms <= PANIC_MS:
         return best_move.uci()
 
-    # Soft budget: what this move deserves. Hard budget: how far the search may overrun it, and
-    # only while the best move is still unstable. Both are clamped so the clock can never flag.
-    clamp = max(1.0, time_left_ms - OVERHEAD_MS)
-    soft_ms = min(_budget(board, time_left_ms, len(moves)), clamp)
-    hard_ms = min(soft_ms * OVERRUN_FACTOR, clamp)
-    start = time.perf_counter()
-    _deadline = start + soft_ms / 1000.0
+    budget_ms = _budget(board, time_left_ms, len(moves))
+    _deadline = time.perf_counter() + budget_ms / 1000.0
 
-    best_move, _ = _search_root(board, ordered, best_move, start, soft_ms, hard_ms)
+    best_move, _ = _search_root(board, ordered, best_move)
 
     # The clock becomes the opponent's the moment we return, so hand the idle core a head
     # start on the position we expect to be asked about next.
@@ -530,27 +582,13 @@ def _budget(board: chess.Board, time_left_ms: int, n_moves: int) -> float:
 
 
 def _search_root(
-    board: chess.Board,
-    ordered: list[chess.Move],
-    best_move: chess.Move,
-    start: float,
-    soft_ms: float,
-    hard_ms: float,
+    board: chess.Board, ordered: list[chess.Move], best_move: chess.Move
 ) -> tuple[chess.Move, float]:
-    """Iterative deepening with aspiration windows. Returns the best move and its score.
-
-    The deadline starts at the soft budget and is re-set after every completed iteration: a
-    settled position keeps the soft deadline (so the next iteration that crosses it is aborted
-    and we stop), while a position whose best move just changed is granted the hard deadline,
-    buying it another ply. This never shortens the search below the soft budget, so it cannot
-    make a move worse -- it only spends extra clock where the choice is still moving.
-    """
-    global _timed_out, _deadline
+    """Iterative deepening with aspiration windows. Returns the best move and its score."""
+    global _timed_out
     score = 0.0
 
     for depth in range(1, MAX_PLY):
-        if depth >= 2 and time.perf_counter() >= _deadline:
-            break
         # Aspiration: the score rarely moves much between iterations, so search a narrow band
         # around the last one. A hit prunes far more; a miss costs one re-search, so the window
         # widens on failure rather than being retried at the same size.
@@ -583,16 +621,7 @@ def _search_root(
             if window != math.inf and (alpha <= lo or alpha >= hi):
                 window *= 4  # fell outside the band: widen and redo this depth
                 continue
-            changed = candidate != best_move
             best_move, score = candidate, alpha
-            # Grant the hard deadline only when the choice is still moving and we are deep
-            # enough for the extra ply to be worth it; otherwise snap back to the soft deadline,
-            # so a position that has just settled stops at the soft budget even if a previous
-            # unstable iteration had extended it.
-            if changed and depth >= OVERRUN_MIN_DEPTH:
-                _deadline = start + hard_ms / 1000.0
-            else:
-                _deadline = start + soft_ms / 1000.0
             break
 
     return best_move, score

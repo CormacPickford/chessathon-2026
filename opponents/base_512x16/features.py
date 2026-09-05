@@ -42,7 +42,7 @@ NUM_FEATURES = 768
 # tree grows ~43%. Dividing by the measured slope puts the output back on a true centipawn
 # footing and hands delta pruning the scale it was tuned for.
 TRAIN_SCALE = 200.0  # cp per logit in the training target: sigmoid(cp / TRAIN_SCALE)
-EVAL_SCALE = 532.0  # 1 / fitted logit-per-cp slope (0.00188) for the 35-epoch 10M-data 256 net
+EVAL_SCALE = 506.0  # 1 / fitted logit-per-cp slope (0.00198) for the 10M-data 512x16 net
 
 _OUR_BASE = 0
 _THEIR_BASE = 6

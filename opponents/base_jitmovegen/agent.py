@@ -16,9 +16,9 @@ from collections.abc import Iterator
 import chess
 import numpy as np
 
-import evalnet
-import qsearch
-from features import EVAL_SCALE
+from . import evalnet
+from . import qsearch
+from .features import EVAL_SCALE
 
 MATE = 1_000_000
 # The net emits a logit (sigmoid of it is the mover's win probability); EVAL_SCALE converts
@@ -49,24 +49,15 @@ CHECK_EXT_MAX_DEPTH = 6  # extend checks only near the leaves, or the tree explo
 # last one and widen only on a miss.
 ASPIRATION_WINDOW = 50.0
 
-# Instability-aware overrun. The search normally stops at the soft budget from `_budget`. But
-# when the best move keeps CHANGING between iterations, that is exactly the position where one
-# more ply is most likely to change the choice again -- so the deadline is extended toward a
-# hard multiple of the soft budget, and only then. A settled position (best move unchanged) is
-# never granted the extension, so easy moves stay cheap. This only ever ADDS search on unstable
-# moments and never removes any, so it cannot make a move worse; the cost is some extra clock,
-# which the hard clamp in get_move keeps clear of a flag fall. OVERRUN applies from depth 5 up,
-# below which iterations are nearly free and the best move is not yet meaningful.
-OVERRUN_FACTOR = 1.6  # an unstable search may run to this multiple of the soft budget
-OVERRUN_MIN_DEPTH = 5
-
-# Subtrees at this depth or below run entirely in the jitted negamax (qsearch.py) instead of
-# the Python search, trading the Python search machinery at those nodes for compiled-code speed
-# with no python-chess board. The jitted core carries its own null move, LMR, futility, RFP,
-# PVS, check extensions and a transposition table, so the tree stays pruned and transpositions
-# cut. With the jitted TT, 4 is the sweet spot (fastest to depth 9, plateaus above). 0 =
-# disabled (old behaviour). Tuned by A/B.
-JIT_LEAF_DEPTH = 4
+# Time reallocation across iterations. Each deepening iteration costs about as much as all the
+# ones before it, so starting one late in the budget mostly buys an aborted search. When the
+# best move has held steady for a few iterations it very rarely changes again -- stop early and
+# bank the clock. When it is still flipping, that is exactly where more time converts into a
+# different, better move -- let the search run past its soft budget toward a hard deadline.
+HARD_BUDGET_FACTOR = 2.0  # an unstable search may run to this multiple of the soft budget
+SOFT_STOP_STABLE = 0.5  # no new iteration past this fraction of the soft budget, if settled
+SOFT_STOP_UNSTABLE = 1.0  # ... or this fraction, while the best move is still moving
+STABLE_ITERS = 2  # consecutive same-best iterations before the choice counts as settled
 
 # Pondering, on the opponent's clock. Bounded so a background search cannot outlive the
 # opponent's turn by much, and skipped in time trouble where the join would itself cost too
@@ -318,17 +309,6 @@ def negamax(
     if depth == 0:
         return quiesce(board, alpha, beta, ply)
 
-    # Hand the shallowest subtrees -- the vast majority of interior nodes -- to the fully
-    # jitted plain negamax, which runs the whole subtree (make, generation, legality,
-    # quiescence) without a python-chess object. It carries no TT/pruning, so it is only worth
-    # it where the subtree is small; above JIT_LEAF_DEPTH the Python search keeps its TT, null
-    # move, LMR and futility. JIT_LEAF_DEPTH=0 reproduces the old behaviour exactly. The jitted
-    # core is proven score-identical to a plain Python search by training/test_negamax.py, and
-    # its move generation perft-matches python-chess.
-    if depth <= JIT_LEAF_DEPTH:
-        return qsearch.negamax_tt_board(
-            board, depth, alpha, beta, ply, can_null, QS_MAX_DEPTH, DELTA_MARGIN)
-
     alpha_orig = alpha
     key = _tt_key(board)
     entry = _TT.get(key)
@@ -489,15 +469,15 @@ def get_move(fen: str, time_left_ms: int) -> str:
     if time_left_ms <= PANIC_MS:
         return best_move.uci()
 
-    # Soft budget: what this move deserves. Hard budget: how far the search may overrun it, and
-    # only while the best move is still unstable. Both are clamped so the clock can never flag.
-    clamp = max(1.0, time_left_ms - OVERHEAD_MS)
-    soft_ms = min(_budget(board, time_left_ms, len(moves)), clamp)
-    hard_ms = min(soft_ms * OVERRUN_FACTOR, clamp)
+    # Soft budget: what this move deserves. Hard deadline: how far an unstable search may
+    # overrun it, still clamped so the clock can never be flagged. _search_root stops early
+    # against the soft number when the best move has settled.
+    soft_ms = _budget(board, time_left_ms, len(moves))
+    hard_ms = min(soft_ms * HARD_BUDGET_FACTOR, max(1.0, time_left_ms - OVERHEAD_MS))
     start = time.perf_counter()
-    _deadline = start + soft_ms / 1000.0
+    _deadline = start + hard_ms / 1000.0
 
-    best_move, _ = _search_root(board, ordered, best_move, start, soft_ms, hard_ms)
+    best_move, _ = _search_root(board, ordered, best_move, start, soft_ms)
 
     # The clock becomes the opponent's the moment we return, so hand the idle core a head
     # start on the position we expect to be asked about next.
@@ -535,22 +515,19 @@ def _search_root(
     best_move: chess.Move,
     start: float,
     soft_ms: float,
-    hard_ms: float,
 ) -> tuple[chess.Move, float]:
-    """Iterative deepening with aspiration windows. Returns the best move and its score.
-
-    The deadline starts at the soft budget and is re-set after every completed iteration: a
-    settled position keeps the soft deadline (so the next iteration that crosses it is aborted
-    and we stop), while a position whose best move just changed is granted the hard deadline,
-    buying it another ply. This never shortens the search below the soft budget, so it cannot
-    make a move worse -- it only spends extra clock where the choice is still moving.
-    """
-    global _timed_out, _deadline
+    """Iterative deepening with aspiration windows. Returns the best move and its score."""
+    global _timed_out
     score = 0.0
+    stable = 0  # consecutive completed iterations that agreed on the best move
 
     for depth in range(1, MAX_PLY):
-        if depth >= 2 and time.perf_counter() >= _deadline:
-            break
+        # Below depth 5 iterations are near-free and seed ordering; always run them. Past
+        # that, weigh the cost of another iteration against how settled the choice looks.
+        if depth >= 5:
+            frac = SOFT_STOP_STABLE if stable >= STABLE_ITERS else SOFT_STOP_UNSTABLE
+            if (time.perf_counter() - start) * 1000.0 >= soft_ms * frac:
+                break
         # Aspiration: the score rarely moves much between iterations, so search a narrow band
         # around the last one. A hit prunes far more; a miss costs one re-search, so the window
         # widens on failure rather than being retried at the same size.
@@ -583,16 +560,8 @@ def _search_root(
             if window != math.inf and (alpha <= lo or alpha >= hi):
                 window *= 4  # fell outside the band: widen and redo this depth
                 continue
-            changed = candidate != best_move
+            stable = stable + 1 if candidate == best_move else 0
             best_move, score = candidate, alpha
-            # Grant the hard deadline only when the choice is still moving and we are deep
-            # enough for the extra ply to be worth it; otherwise snap back to the soft deadline,
-            # so a position that has just settled stops at the soft budget even if a previous
-            # unstable iteration had extended it.
-            if changed and depth >= OVERRUN_MIN_DEPTH:
-                _deadline = start + hard_ms / 1000.0
-            else:
-                _deadline = start + soft_ms / 1000.0
             break
 
     return best_move, score
