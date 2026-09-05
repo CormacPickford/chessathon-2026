@@ -1144,11 +1144,237 @@ def negamax_pruned_board(board: chess.Board, depth: int, alpha: float, beta: flo
     ))
 
 
+# ---------------------------------------------------------------------------
+# Jitted transposition table for the interior negamax. A direct-mapped array TT (always
+# replace) keyed by a hash of the position. The point: with cutoffs and a best-move-first
+# ordering the jitted search stays cheap at higher JIT_LEAF_DEPTH, so more of the tree can run
+# jitted instead of in python-chess. A hash collision can only return a wrong score or an
+# illegal ordering hint -- the latter is caught by the make+king-safety filter, and the root
+# move is still chosen in Python, so neither can produce an illegal move played.
+#
+# Persistence mirrors the Python TT: entries live across moves within a game (the process
+# restarts per game, so the arrays start empty each game) and non-mate scores are position-
+# intrinsic, so they stay valid. Mate scores are ply-relative and never stored, exactly as in
+# agent.negamax.
+# ---------------------------------------------------------------------------
+
+_TT_BITS = 22
+_TT_SIZE = 1 << _TT_BITS
+_TT_MASK = _TT_SIZE - 1
+_JTT_KEY = np.zeros(_TT_SIZE, dtype=np.int64)
+_JTT_DEPTH = np.full(_TT_SIZE, -1, dtype=np.int16)
+_JTT_FLAG = np.zeros(_TT_SIZE, dtype=np.int8)  # 0 exact, 1 lower, 2 upper
+_JTT_SCORE = np.zeros(_TT_SIZE, dtype=np.float32)
+_JTT_MOVE = np.zeros(_TT_SIZE, dtype=np.int32)
+_TT_ORDER_BIT = np.int64(1) << 50  # marks the TT move so one descending sort floats it first
+
+_HASH_P = np.int64(-7046029254386353131)  # 0x9E3779B97F4A7C15, a large odd multiplier
+
+
+@njit(cache=False, nogil=True)
+def _hash(p: int, n: int, b: int, r: int, q: int, k: int,
+          occw: int, occb: int, wtm: bool, ep: int, castling: int) -> int:
+    h = np.int64(1469598103934665603)
+    h = (h ^ p) * _HASH_P
+    h = (h ^ n) * _HASH_P
+    h = (h ^ b) * _HASH_P
+    h = (h ^ r) * _HASH_P
+    h = (h ^ q) * _HASH_P
+    h = (h ^ k) * _HASH_P
+    h = (h ^ occw) * _HASH_P
+    h = (h ^ occb) * _HASH_P
+    h = (h ^ (np.int64(1) if wtm else np.int64(0))) * _HASH_P
+    h = (h ^ castling) * _HASH_P
+    h = (h ^ np.int64(ep)) * _HASH_P
+    h ^= h >> 33
+    h *= _HASH_P
+    h ^= h >> 29
+    return int(h)
+
+
+def reset_tt() -> None:
+    """Empty the jitted TT. Not needed on the platform (fresh process per game); used by tests
+    and benchmarks that reuse the process across unrelated positions."""
+    _JTT_DEPTH.fill(-1)
+
+
+@njit(cache=False, nogil=True)
+def _negamax_tt(
+    depth: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+    alpha: float, beta: float, ply: int, can_null: bool,
+    qs_max_depth: int, delta_margin: int, dual: bool,
+    tt_key: np.ndarray, tt_depth: np.ndarray, tt_flag: np.ndarray,
+    tt_score: np.ndarray, tt_move: np.ndarray,
+    w1: np.ndarray, b1: np.ndarray, w2: np.ndarray, b2: np.ndarray,
+    w3: np.ndarray, b3: np.ndarray,
+) -> float:
+    """_negamax_pruned plus a transposition table: probe for a cutoff or a best-move ordering
+    hint, store the result on the way out. Mate scores are never stored (ply-relative). The TT
+    arrays are passed in rather than read as globals because numba treats module-level arrays as
+    read-only, so they could not be written otherwise."""
+    if depth == 0:
+        return _quiesce_bb(p, n, b, r, q, k, occw, occb, wtm, ep,
+                           alpha, beta, 0, ply, qs_max_depth, delta_margin, dual,
+                           w1, b1, w2, b2, w3, b3)
+
+    alpha_orig = alpha
+    h = _hash(p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+    idx = h & _TT_MASK
+    tt_mv = 0
+    if tt_key[idx] == h and tt_depth[idx] >= 0:
+        tt_mv = tt_move[idx]
+        if tt_depth[idx] >= depth:
+            f = tt_flag[idx]
+            s = float(tt_score[idx])
+            if f == 0:
+                return s
+            if f == 1 and s > alpha:
+                alpha = s
+            elif f == 2 and s < beta:
+                beta = s
+            if alpha >= beta:
+                return s
+
+    us = occw if wtm else occb
+    kbb = k & us
+    ksq = _bit_index(kbb & -kbb)
+    occ = occw | occb
+    in_check = _attackers(ksq, occ, not wtm, p, n, b, r, q, k, occw, occb) != 0
+
+    have_static = False
+    static = 0.0
+    if (not in_check) and depth <= _RFP_MAX_DEPTH and beta < _MATE_ZONE:
+        static = _eval_here(p, n, b, r, q, k, occw, occb, wtm, dual, w1, b1, w2, b2, w3, b3)
+        have_static = True
+        if static - _RFP_MARGIN * depth >= beta:
+            return beta
+
+    if (can_null and not in_check and depth >= 3 and beta < _MATE_ZONE
+            and (us & (n | b | r | q)) != 0):
+        red = 2 + (1 if depth >= 6 else 0)
+        score = -_negamax_tt(depth - 1 - red, p, n, b, r, q, k, occw, occb, not wtm, -1,
+                             castling, -beta, -beta + 1.0, ply + 1, False,
+                             qs_max_depth, delta_margin, dual,
+                             tt_key, tt_depth, tt_flag, tt_score, tt_move,
+                             w1, b1, w2, b2, w3, b3)
+        if score >= beta:
+            return beta
+
+    futile = False
+    if (not in_check) and depth <= _FUTILITY_MAX_DEPTH and alpha > -_MATE_ZONE:
+        if not have_static:
+            static = _eval_here(p, n, b, r, q, k, occw, occb, wtm, dual,
+                                w1, b1, w2, b2, w3, b3)
+        futile = static + _FUTILITY_MARGIN * depth <= alpha
+
+    out = np.empty(256, dtype=np.int64)
+    cnt = _gen_all(out, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+    if tt_mv != 0:
+        for i in range(cnt):
+            if (out[i] & _KEY_MOVE_MASK) == tt_mv:
+                out[i] |= _TT_ORDER_BIT
+                break
+    _sort_desc(out, cnt)
+
+    moves_done = 0
+    best_mv = 0
+    for i in range(cnt):
+        key = out[i]
+        mv = key & _KEY_MOVE_MASK
+        tier = (key >> 40) & 0xFF
+        promo = (mv >> 12) & 7
+        is_quiet = tier == 0 and promo == 0
+
+        np_, nn, nb, nr, nq, nk, nw, nbl, nep, nc = _make_full(
+            mv, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+        if not _own_king_safe(np_, nn, nb, nr, nq, nk, nw, nbl, wtm):
+            continue
+
+        opp_occ = nbl if wtm else nw
+        okbb = nk & opp_occ
+        oksq = _bit_index(okbb & -okbb)
+        new_occ = nw | nbl
+        gives_check = _attackers(oksq, new_occ, wtm, np_, nn, nb, nr, nq, nk, nw, nbl) != 0
+
+        if futile and is_quiet and moves_done > 0 and not gives_check:
+            continue
+
+        ext = 1 if gives_check and depth <= _CHECK_EXT_MAX_DEPTH else 0
+        red = 0
+        if is_quiet and depth >= 3 and moves_done >= 3 and not in_check and not gives_check:
+            red = 1 + (1 if moves_done >= 6 else 0)
+        new_depth = depth - 1 + ext
+
+        if moves_done == 0:
+            score = -_negamax_tt(new_depth, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm, nep,
+                                 nc, -beta, -alpha, ply + 1, True,
+                                 qs_max_depth, delta_margin, dual,
+                                 tt_key, tt_depth, tt_flag, tt_score, tt_move,
+                                 w1, b1, w2, b2, w3, b3)
+        else:
+            score = -_negamax_tt(new_depth - red, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm,
+                                 nep, nc, -alpha - 1.0, -alpha, ply + 1, True,
+                                 qs_max_depth, delta_margin, dual,
+                                 tt_key, tt_depth, tt_flag, tt_score, tt_move,
+                                 w1, b1, w2, b2, w3, b3)
+            if alpha < score < beta:
+                score = -_negamax_tt(new_depth, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm,
+                                     nep, nc, -beta, -alpha, ply + 1, True,
+                                     qs_max_depth, delta_margin, dual,
+                                     tt_key, tt_depth, tt_flag, tt_score, tt_move,
+                                     w1, b1, w2, b2, w3, b3)
+        moves_done += 1
+        if score > alpha:
+            alpha = score
+            best_mv = mv
+        if alpha >= beta:
+            break
+
+    if moves_done == 0:
+        return float(-MATE + ply) if in_check else 0.0
+
+    # Store, unless the score is a ply-relative mate value (those must never enter the table).
+    if -_MATE_ZONE < alpha < _MATE_ZONE:
+        if alpha <= alpha_orig:
+            flag = 2  # never beat the original alpha: an upper bound
+        elif alpha >= beta:
+            flag = 1  # cut off: a lower bound
+        else:
+            flag = 0  # exact
+        tt_key[idx] = h
+        tt_depth[idx] = depth
+        tt_flag[idx] = flag
+        tt_score[idx] = alpha
+        tt_move[idx] = best_mv
+    return alpha
+
+
+def negamax_tt_board(board: chess.Board, depth: int, alpha: float, beta: float,
+                     ply: int, can_null: bool, qs_max_depth: int,
+                     delta_margin: int) -> float:
+    """Entry point for the TT-backed jitted negamax -- the agent's shallow-subtree delegate."""
+    return float(_negamax_tt(
+        depth,
+        to_signed(board.pawns), to_signed(board.knights), to_signed(board.bishops),
+        to_signed(board.rooks), to_signed(board.queens), to_signed(board.kings),
+        to_signed(board.occupied_co[True]), to_signed(board.occupied_co[False]),
+        board.turn, -1 if board.ep_square is None else board.ep_square,
+        to_signed(board.castling_rights),
+        alpha, beta, ply, can_null, qs_max_depth, delta_margin, evalnet.MODE_DUAL,
+        _JTT_KEY, _JTT_DEPTH, _JTT_FLAG, _JTT_SCORE, _JTT_MOVE,
+        evalnet.W1, evalnet.B1, evalnet.W2, evalnet.B2, evalnet.W3, evalnet.B3,
+    ))
+
+
 # Warm the whole tree at import so compilation lands in the init budget, never on the clock.
 _b = chess.Board()
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)
 perft(_b, 1)
 negamax_plain_board(_b, 1, -1e9, 1e9, 0, 8, 200)
 negamax_pruned_board(_b, 3, -1e9, 1e9, 0, True, 8, 200)
+negamax_tt_board(_b, 3, -1e9, 1e9, 0, True, 8, 200)
+reset_tt()
 _b.push_uci("e2e4")
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)

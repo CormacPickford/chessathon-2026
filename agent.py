@@ -61,13 +61,12 @@ OVERRUN_FACTOR = 1.6  # an unstable search may run to this multiple of the soft 
 OVERRUN_MIN_DEPTH = 5
 
 # Subtrees at this depth or below run entirely in the jitted negamax (qsearch.py) instead of
-# the Python search, trading the Python TT/killers/history at those shallow nodes for
-# compiled-code speed with no python-chess board. The jitted core carries its own null move,
-# LMR, futility, RFP, PVS and check extensions, so the tree stays pruned. 3 is the sweet spot:
-# depth <= 3 is already the great majority of nodes, so going higher barely adds speed while
-# removing the TT from more of the tree. 0 = disabled (old behaviour). Tuned by A/B.
-JIT_LEAF_DEPTH = 3
-STABLE_ITERS = 2  # consecutive same-best iterations before the choice counts as settled
+# the Python search, trading the Python search machinery at those nodes for compiled-code speed
+# with no python-chess board. The jitted core carries its own null move, LMR, futility, RFP,
+# PVS, check extensions and a transposition table, so the tree stays pruned and transpositions
+# cut. With the jitted TT, 4 is the sweet spot (fastest to depth 9, plateaus above). 0 =
+# disabled (old behaviour). Tuned by A/B.
+JIT_LEAF_DEPTH = 4
 
 # Pondering, on the opponent's clock. Bounded so a background search cannot outlive the
 # opponent's turn by much, and skipped in time trouble where the join would itself cost too
@@ -327,7 +326,7 @@ def negamax(
     # core is proven score-identical to a plain Python search by training/test_negamax.py, and
     # its move generation perft-matches python-chess.
     if depth <= JIT_LEAF_DEPTH:
-        return qsearch.negamax_pruned_board(
+        return qsearch.negamax_tt_board(
             board, depth, alpha, beta, ply, can_null, QS_MAX_DEPTH, DELTA_MARGIN)
 
     alpha_orig = alpha
