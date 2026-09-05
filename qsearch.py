@@ -1007,10 +1007,148 @@ def negamax_plain_board(board: chess.Board, depth: int, alpha: float, beta: floa
     ))
 
 
+# Pruning constants for the jitted interior negamax. Kept in step with agent.py's values by
+# hand -- they are passed nowhere, so if the agent's are retuned these must be edited to match.
+_RFP_MAX_DEPTH = 4
+_RFP_MARGIN = 120.0
+_FUTILITY_MAX_DEPTH = 3
+_FUTILITY_MARGIN = 150.0
+_CHECK_EXT_MAX_DEPTH = 6
+_MATE_ZONE = MATE - 10_000
+
+
+@njit(cache=False, nogil=True)
+def _negamax_pruned(
+    depth: int,
+    p: int, n: int, b: int, r: int, q: int, k: int,
+    occw: int, occb: int, wtm: bool, ep: int, castling: int,
+    alpha: float, beta: float, ply: int, can_null: bool,
+    qs_max_depth: int, delta_margin: int, dual: bool,
+    w1: np.ndarray, b1: np.ndarray, w2: np.ndarray, b2: np.ndarray,
+    w3: np.ndarray, b3: np.ndarray,
+) -> float:
+    """Alpha-beta with the same pruning as agent.negamax -- reverse futility, null move,
+    futility, PVS, LMR and check extensions -- but run entirely jitted, with no transposition
+    table and no killers/history (moves come in _gen_all's MVV-LVA-then-piece order). Used for
+    the shallow subtrees the agent delegates; validated by game A/B, not score parity, since the
+    pruning deliberately diverges from the plain reference. Mate scores relative to `ply`."""
+    if depth == 0:
+        return _quiesce_bb(p, n, b, r, q, k, occw, occb, wtm, ep,
+                           alpha, beta, 0, ply, qs_max_depth, delta_margin, dual,
+                           w1, b1, w2, b2, w3, b3)
+
+    us = occw if wtm else occb
+    kbb = k & us
+    ksq = _bit_index(kbb & -kbb)
+    occ = occw | occb
+    in_check = _attackers(ksq, occ, not wtm, p, n, b, r, q, k, occw, occb) != 0
+
+    have_static = False
+    static = 0.0
+    if (not in_check) and depth <= _RFP_MAX_DEPTH and beta < _MATE_ZONE:
+        static = _eval_here(p, n, b, r, q, k, occw, occb, wtm, dual, w1, b1, w2, b2, w3, b3)
+        have_static = True
+        if static - _RFP_MARGIN * depth >= beta:
+            return beta
+
+    if (can_null and not in_check and depth >= 3 and beta < _MATE_ZONE
+            and (us & (n | b | r | q)) != 0):
+        red = 2 + (1 if depth >= 6 else 0)
+        score = -_negamax_pruned(depth - 1 - red, p, n, b, r, q, k, occw, occb, not wtm, -1,
+                                 castling, -beta, -beta + 1.0, ply + 1, False,
+                                 qs_max_depth, delta_margin, dual, w1, b1, w2, b2, w3, b3)
+        if score >= beta:
+            return beta
+
+    futile = False
+    if (not in_check) and depth <= _FUTILITY_MAX_DEPTH and alpha > -_MATE_ZONE:
+        if not have_static:
+            static = _eval_here(p, n, b, r, q, k, occw, occb, wtm, dual,
+                                w1, b1, w2, b2, w3, b3)
+        futile = static + _FUTILITY_MARGIN * depth <= alpha
+
+    out = np.empty(256, dtype=np.int64)
+    cnt = _gen_all(out, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+    _sort_desc(out, cnt)
+
+    moves_done = 0
+    for i in range(cnt):
+        key = out[i]
+        mv = key & _KEY_MOVE_MASK
+        tier = (key >> 40) & 0xFF
+        promo = (mv >> 12) & 7
+        is_quiet = tier == 0 and promo == 0
+
+        np_, nn, nb, nr, nq, nk, nw, nbl, nep, nc = _make_full(
+            mv, p, n, b, r, q, k, occw, occb, wtm, ep, castling)
+        if not _own_king_safe(np_, nn, nb, nr, nq, nk, nw, nbl, wtm):
+            continue
+
+        # Does this move give check? Look at the opponent's king in the child position.
+        opp_occ = nbl if wtm else nw
+        okbb = nk & opp_occ
+        oksq = _bit_index(okbb & -okbb)
+        new_occ = nw | nbl
+        gives_check = _attackers(oksq, new_occ, wtm, np_, nn, nb, nr, nq, nk, nw, nbl) != 0
+
+        if futile and is_quiet and moves_done > 0 and not gives_check:
+            continue  # keep at least one move so the node still returns something real
+
+        ext = 1 if gives_check and depth <= _CHECK_EXT_MAX_DEPTH else 0
+        red = 0
+        if is_quiet and depth >= 3 and moves_done >= 3 and not in_check and not gives_check:
+            red = 1 + (1 if moves_done >= 6 else 0)
+        new_depth = depth - 1 + ext
+
+        if moves_done == 0:
+            score = -_negamax_pruned(new_depth, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm, nep,
+                                     nc, -beta, -alpha, ply + 1, True,
+                                     qs_max_depth, delta_margin, dual, w1, b1, w2, b2, w3, b3)
+        else:
+            score = -_negamax_pruned(new_depth - red, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm,
+                                     nep, nc, -alpha - 1.0, -alpha, ply + 1, True,
+                                     qs_max_depth, delta_margin, dual, w1, b1, w2, b2, w3, b3)
+            if alpha < score < beta:
+                score = -_negamax_pruned(new_depth, np_, nn, nb, nr, nq, nk, nw, nbl, not wtm,
+                                         nep, nc, -beta, -alpha, ply + 1, True,
+                                         qs_max_depth, delta_margin, dual,
+                                         w1, b1, w2, b2, w3, b3)
+        moves_done += 1
+        if score > alpha:
+            alpha = score
+        if alpha >= beta:
+            break
+
+    if moves_done == 0:
+        return float(-MATE + ply) if in_check else 0.0
+    return alpha
+
+
+def negamax_pruned_board(board: chess.Board, depth: int, alpha: float, beta: float,
+                         ply: int, can_null: bool, qs_max_depth: int,
+                         delta_margin: int) -> float:
+    """Entry point for the pruned jitted negamax -- the agent's shallow-subtree delegate.
+
+    `can_null` carries the Python parent's null-move state, so a subtree delegated right after a
+    null move does not immediately forfeit a second move (which the Python search also forbids).
+    """
+    return float(_negamax_pruned(
+        depth,
+        to_signed(board.pawns), to_signed(board.knights), to_signed(board.bishops),
+        to_signed(board.rooks), to_signed(board.queens), to_signed(board.kings),
+        to_signed(board.occupied_co[True]), to_signed(board.occupied_co[False]),
+        board.turn, -1 if board.ep_square is None else board.ep_square,
+        to_signed(board.castling_rights),
+        alpha, beta, ply, can_null, qs_max_depth, delta_margin, evalnet.MODE_DUAL,
+        evalnet.W1, evalnet.B1, evalnet.W2, evalnet.B2, evalnet.W3, evalnet.B3,
+    ))
+
+
 # Warm the whole tree at import so compilation lands in the init budget, never on the clock.
 _b = chess.Board()
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)
 perft(_b, 1)
 negamax_plain_board(_b, 1, -1e9, 1e9, 0, 8, 200)
+negamax_pruned_board(_b, 3, -1e9, 1e9, 0, True, 8, 200)
 _b.push_uci("e2e4")
 quiesce_board(_b, -1e9, 1e9, 0, 8, 200)

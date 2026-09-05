@@ -6,4 +6,5 @@
 - [A/B measurement (2400 push)](ab-measurement-2400-push.md) — snapshot packages, sf2400+ dials, ponder-off elo, netquality.py; goal 1773→2400
 - [Eval is the bottleneck](eval-is-bottleneck.md) — post-staged profile: eval ~26% of search, not movegen; retrain-at-same-arch is free quality; search already tuned
 - [Jitted qsearch](jitted-qsearch.md) — quiescence + interior movegen in numba, set/score-identical; 1.59x search speedup; validation recipe
+- [Jitted interior negamax](jitted-interior-negamax.md) — shallow subtrees run jitted (perft + score-parity verified); JIT_LEAF_DEPTH=3 sweet spot; +35 Elo committed, pruned pending
 - [Time management overrun](time-management-overrun.md) — instability-aware search extension; safe (only-adds); why the banking version blundered; cploss can't judge it
